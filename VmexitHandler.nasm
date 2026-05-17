@@ -72,117 +72,179 @@ AsmVmexitHandler:
 ; code stays fully position-independent after CopyMem.
 ;
 ; Stack layout after the four pushes:
-;   [rsp+24] = saved RAX   (guest RAX)
-;   [rsp+16] = saved RBX
-;   [rsp+ 8] = saved RCX   (guest RCX)
-;   [rsp+ 0] = saved RDX   (guest RDX)
+;   [rsp+48] = saved RAX   (guest RAX)
+;   [rsp+40] = saved RBX
+;   [rsp+32] = saved RCX   (guest RCX)
+;   [rsp+24] = saved RDX   (guest RDX)
+;   [rsp+16] = saved r13
+;   [rsp+ 8] = saved r14
+;   [rsp+ 0] = saved r15
 ; ============================================================
 MinimalVmexitHandlerStart:
     push rax
     push rbx
     push rcx
     push rdx
+    push r13
+    push r14
+    push r15
 
-    ; ── Read exit reason (keep in RBX throughout) ─────────────
+    ; ── Read exit reason ──────────────────────────────────────
     mov  rcx, 0x4402
     vmread rbx, rcx
-    and  rbx, 0xFFFF        ; basic exit reason in RBX
+    and  rbx, 0xFFFF
 
-    ; ── Debug: log exit reason to ring buffer ─────────────────
-    ; Step 1: get our runtime page base using LEA anchor.
-    ;         page_base = &.anchor - (.anchor - MinimalVmexitHandlerStart) - 16
-    lea  rax, [rel .anchor]   ; rax = runtime addr of .anchor
+    ; ── Get GUEST_RIP for debugging ──────────────────────────
+    push rbx
+    mov  rcx, 0x681E        ; GUEST_RIP
+    vmread rax, rcx
+    mov  r15, rax           ; Save GUEST_RIP in R15 (non-volatile across our code)
+    pop  rbx
+
+    ; ── Debug ring buffer (first 64 exits) ───────────────────
+    lea  rax, [rel .anchor]
 .anchor:
     sub  rax, (.anchor - MinimalVmexitHandlerStart) + 16
-    ; rax = HandlerDest page base
 
-    ; Step 2: atomically increment counter, bail if >= 64
-    mov  rcx, [rax + 8]       ; current count
+    mov  rcx, [rax + 8]
     cmp  rcx, 64
     jge  .log_done
     inc  qword [rax + 8]
 
-    ; Step 3: write 2-byte exit reason at counter*4 offset in debug page
-    mov  rdx, [rax]           ; debug log page address
+    mov  rdx, [rax]
     test rdx, rdx
     jz   .log_done
-    shl  rcx, 2               ; byte offset = count * 4
+    shl  rcx, 2
     add  rdx, rcx
-    mov  [rdx],   bl          ; exit reason low byte
-    mov  [rdx+1], bh          ; exit reason high byte
-    mov  word [rdx+2], 0      ; pad
+    mov  [rdx],   bl
+    mov  [rdx+1], bh
+    mov  word [rdx+2], 0
 
-    ; Step 4: Write directly to COM1 (0x3F8) so we can see it before freeze!
-    ; We write "E:XX " where XX is the hex representation of the exit reason
+.log_done:
+    ; ── ALWAYS log to COM1: "E:XX R:XXXXXXXXXXXXXXXX " ────────
     push rdx
     push rax
-    push rbx
-    push rcx
+    push r15
     
     mov  dx, 0x3F8
+    
+    ; "E:"
     mov  al, 'E'
     out  dx, al
     mov  al, ':'
     out  dx, al
-
-    ; High nibble
+    
+    ; Exit reason (2 hex digits)
     mov  al, bl
     shr  al, 4
     cmp  al, 10
-    jl   .high_digit
+    jl   .h1
     add  al, 'A' - 10
-    jmp  .high_out
-.high_digit:
+    jmp  .h2
+.h1:
     add  al, '0'
-.high_out:
+.h2:
     out  dx, al
-
-    ; Low nibble
+    
     mov  al, bl
     and  al, 0x0F
     cmp  al, 10
-    jl   .low_digit
+    jl   .l1
     add  al, 'A' - 10
-    jmp  .low_out
-.low_digit:
+    jmp  .l2
+.l1:
     add  al, '0'
-.low_out:
+.l2:
     out  dx, al
-
+    
+    ; " R:"
     mov  al, ' '
     out  dx, al
-
+    mov  al, 'R'
+    out  dx, al
+    mov  al, ':'
+    out  dx, al
+    
+    ; GUEST_RIP (16 hex digits, high to low)
+    mov  rcx, 16
+    mov  r14, r15           ; R15 = GUEST_RIP
+.rip_loop:
+    dec  rcx
+    mov  rax, r14
+    mov  r13, rcx
+    shl  r13, 2             ; r13 = rcx * 4
+    
+    ; Shift RAX by the value in R13
+    ; Since shr only accepts CL or an immediate, we'll temporarily swap RCX and R13
+    push rcx
+    mov  rcx, r13
+    shr  rax, cl
     pop  rcx
-    pop  rbx
+    
+    and  al, 0x0F
+    cmp  al, 10
+    jl   .rip_digit
+    add  al, 'A' - 10
+    jmp  .rip_out
+.rip_digit:
+    add  al, '0'
+.rip_out:
+    out  dx, al
+    test rcx, rcx
+    jnz  .rip_loop
+    
+    ; " "
+    mov  al, ' '
+    out  dx, al
+    
+    pop  r15
     pop  rax
     pop  rdx
-
-.log_done:
-    ; RBX still holds exit reason; RAX is scratch
 
     ; ── CPUID (0x0A = 10) ────────────────────────────────────
     cmp  rbx, 0x0A
     jne  .not_cpuid
 
-    mov  rax, [rsp + 24]   ; guest RAX (leaf)
-    mov  rcx, [rsp +  8]   ; guest RCX (subleaf)
+    mov  rax, [rsp + 48]
+    mov  rcx, [rsp + 32]
+    
+    ; If EAX is in the hypervisor leaf range (0x40000000 - 0x400000FF), return all 0s
+    cmp  rax, 0x40000000
+    jb   .not_hv_leaf
+    cmp  rax, 0x400000FF
+    ja   .not_hv_leaf
+    
+    xor  rax, rax
+    xor  rbx, rbx
+    xor  rcx, rcx
+    xor  rdx, rdx
+    jmp  .cpuid_store
+
+.not_hv_leaf:
     cmp  rax, 1
     jne  .cpuid_exec
     cpuid
-    btr  ecx, 31            ; clear Hypervisor Present bit
-    btr  ecx, 5             ; clear VMX bit
+    btr  ecx, 31            ; Hide hypervisor present bit
+    btr  ecx, 5             ; Hide VMX support bit
     jmp  .cpuid_store
 .cpuid_exec:
     cpuid
 .cpuid_store:
-    mov  [rsp + 24], rax
-    mov  [rsp + 16], rbx
-    mov  [rsp +  8], rcx
-    mov  [rsp      ], rdx
+    mov  [rsp + 48], rax
+    mov  [rsp + 40], rbx
+    mov  [rsp + 32], rcx
+    mov  [rsp + 24], rdx
     jmp  .advance_rip
 
 .not_cpuid:
-    ; ── RDRAND (0x39) / RDSEED (0x3D) — set CF=1 ──────────
+    ; ── HLT (0x0C) ───────────────────────────────────────────
+    cmp  rbx, 0x0C
+    jne  .not_hlt
+    ; Just advance RIP past HLT and resume (ignore the halt)
+    jmp  .advance_rip
+
+.not_hlt:
+    ; ── RDRAND (0x39) / RDSEED (0x3D) ────────────────────────
     cmp  rbx, 0x39
     je   .set_cf
     cmp  rbx, 0x3D
@@ -190,9 +252,9 @@ MinimalVmexitHandlerStart:
     jmp  .not_rand
 
 .set_cf:
-    mov  rcx, 0x6820        ; GUEST_RFLAGS
+    mov  rcx, 0x6820
     vmread rax, rcx
-    or   rax, 1             ; CF = 1
+    or   rax, 1
     vmwrite rcx, rax
     jmp  .advance_rip
 
@@ -200,28 +262,28 @@ MinimalVmexitHandlerStart:
     ; ── RDMSR (0x1F) ─────────────────────────────────────────
     cmp  rbx, 0x1F
     jne  .not_rdmsr
-    mov  rcx, [rsp + 8]    ; MSR index from guest RCX
+    mov  rcx, [rsp + 32]
     
-    cmp  rcx, 0x3A         ; MSR_IA32_FEATURE_CONTROL
+    cmp  rcx, 0x3A
     jne  .do_rdmsr
-    xor  rax, rax          ; Fake response: VMX disabled
+    xor  rax, rax
     xor  rdx, rdx
     jmp  .rdmsr_done
 
 .do_rdmsr:
-    rdmsr                   ; result in EDX:EAX
+    rdmsr
 .rdmsr_done:
-    mov  [rsp + 24], rax   ; guest RAX (low 32)
-    mov  [rsp      ], rdx  ; guest RDX (high 32)
+    mov  [rsp + 48], rax
+    mov  [rsp + 24], rdx
     jmp  .advance_rip
 
 .not_rdmsr:
     ; ── WRMSR (0x20) ─────────────────────────────────────────
     cmp  rbx, 0x20
     jne  .not_wrmsr
-    mov  rcx, [rsp +  8]   ; MSR index
-    mov  rax, [rsp + 24]   ; low 32
-    mov  rdx, [rsp      ]  ; high 32
+    mov  rcx, [rsp + 32]   ; MSR index
+    mov  rax, [rsp + 48]   ; low 32
+    mov  rdx, [rsp + 24]   ; high 32
     wrmsr
     jmp  .advance_rip
 
@@ -229,27 +291,78 @@ MinimalVmexitHandlerStart:
     ; ── XSETBV (0x37) ────────────────────────────────────────
     cmp  rbx, 0x37
     jne  .not_xsetbv
-    mov  rcx, [rsp +  8]   ; XCR index
-    mov  rax, [rsp + 24]   ; low 32 bits
-    mov  rdx, [rsp      ]  ; high 32 bits
+    mov  rcx, [rsp + 32]   ; XCR index
+    mov  rax, [rsp + 48]   ; low 32 bits
+    mov  rdx, [rsp + 24]   ; high 32 bits
     xsetbv
     jmp  .advance_rip
 
 .not_xsetbv:
     ; ── INVD (0x0D) ──────────────────────────────────────────
     cmp  rbx, 0x0D
-    jne  .advance_rip
+    jne  .not_invd
     wbinvd
+    jmp  .advance_rip
 
-    ; ── Advance guest RIP by VM_EXIT_INSTRUCTION_LEN ─────────
+.not_invd:
+    ; ── IO instruction (0x1E) ────────────────────────────────
+    cmp  rbx, 0x1E
+    jne  .not_io
+    ; Just pass through for now (emulation is complex)
+    jmp  .advance_rip
+
+.not_io:
+    ; ── Unknown: HALT the system with debug output ───────────
+    ; Write "X:XX " to COM to indicate unknown exit
+    push rdx
+    push rax
+    mov  dx, 0x3F8
+    mov  al, 'X'
+    out  dx, al
+    mov  al, ':'
+    out  dx, al
+    mov  al, bl
+    shr  al, 4
+    cmp  al, 10
+    jl   .x1
+    add  al, 'A' - 10
+    jmp  .x2
+.x1:
+    add  al, '0'
+.x2:
+    out  dx, al
+    mov  al, bl
+    and  al, 0x0F
+    cmp  al, 10
+    jl   .x3
+    add  al, 'A' - 10
+    jmp  .x4
+.x3:
+    add  al, '0'
+.x4:
+    out  dx, al
+    mov  al, ' '
+    out  dx, al
+    pop  rax
+    pop  rdx
+    
+    ; HALT — unknown exit, can't continue safely
+    cli
+    hlt
+    jmp $ - 1
+
 .advance_rip:
-    mov  rcx, 0x440C        ; VM_EXIT_INSTRUCTION_LEN
+    mov  rcx, 0x440C
     vmread rdx, rcx
-    mov  rcx, 0x681E        ; GUEST_RIP
+    mov  rcx, 0x681E
     vmread rax, rcx
     add  rax, rdx
     vmwrite rcx, rax
 
+.resume_only:
+    pop  r15
+    pop  r14
+    pop  r13
     pop  rdx
     pop  rcx
     pop  rbx
@@ -329,4 +442,3 @@ AsmVmxon:
 __invept:
     invept rcx, [rdx]
     ret
-
