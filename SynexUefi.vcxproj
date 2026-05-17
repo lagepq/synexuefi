@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="14.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{89D78FD5-8F41-442F-944E-81774DC9DF39}</ProjectGuid>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <Import Project="$(SolutionDir)\samples.default.props" />
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="$(SolutionDir)\samples.props" />
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ItemDefinitionGroup>
+    <Link>
+      <AdditionalDependencies>UefiApplicationEntryPoint.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <SubSystem>EFI Application</SubSystem>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="UefiMain.c" />
+    <ClCompile Include="PhysicalMemory.c" />
+    <ClCompile Include="VmxHelper.c" />
+    <ClCompile Include="Ept.c" />
+    <ClCompile Include="Vmcs.c" />
+    <ClCompile Include="ComLogger.c" />
+    <ClCompile Include="VmexitDispatcher.c" />
+    <ClCompile Include="GuestMemory.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="VmexitHandler.nasm">
+      <Command>nasm.exe -fwin64 -o "$(IntDir)VmexitHandler.obj" "%(FullPath)"</Command>
+      <Outputs>$(IntDir)VmexitHandler.obj</Outputs>
+    </CustomBuild>
+  </ItemGroup>
+</Project>
