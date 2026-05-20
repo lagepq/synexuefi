@@ -1157,7 +1157,7 @@ MinimalVmexitHandlerStart:
     call VgaNewline
 
     ; ── CPU_BASED_VM_EXEC_CONTROL (0x4002) ──────────────────────────
-    lea  rsi, [rel .efh_s_int] ; we can reuse the string var or just rely on the label not mattering as much
+    lea  rsi, [rel .efh_s_cpu]
     call AsmPrintStr
     mov  rcx, 0x4002
     vmread rax, rcx
@@ -1168,7 +1168,7 @@ MinimalVmexitHandlerStart:
     call VgaNewline
 
     ; ── SECONDARY_VM_EXEC_CONTROL (0x401E) ──────────────────────────
-    lea  rsi, [rel .efh_s_int] 
+    lea  rsi, [rel .efh_s_sec]
     call AsmPrintStr
     mov  rcx, 0x401E
     vmread rax, rcx
@@ -1238,7 +1238,8 @@ MinimalVmexitHandlerStart:
 .efh_s_trs: db 'TRS=', 0
 .efh_s_tar: db 'TAR=', 0
 .efh_s_act: db 'ACT=', 0
-.efh_s_int: db 'INT=', 0
+.efh_s_cpu: db 'CPU=', 0
+.efh_s_sec: db 'SEC=', 0
 .efh_s_css: db 'CSS=', 0
 .efh_s_sar: db 'SAR=', 0
 .efh_crlf:  db 13, 10, 0
@@ -2120,10 +2121,65 @@ handle_sipi:
     mov  rcx, 0x4826         ; GUEST_ACTIVITY_STATE
     vmwrite rcx, rax
 
-    ; 8. Turn off IA-32e Mode Guest control in VMCS
-    mov  rcx, 0x4012         ; VM_ENTRY_CONTROLS
-    vmread rax, rcx
-    and  rax, ~0x200          ; clear VMENTRY_IA32E_GUEST (bit 9)
+    ; 8. Clear IA-32e guest mode
+    mov  rcx, 0x4012
+    vmread r8, rcx               ; r8 = current VM_ENTRY_CONTROLS
+
+    ; Jump over debug strings
+    jmp  .sipi_dbg_start
+.sipi_dbg_prefix: db '[SIPI] ENC old: ', 0
+.sipi_dbg_mid:    db ' new: ', 0
+.sipi_crlf:       db 13, 10, 0
+.sipi_dbg_start:
+
+    ; Print old ENC to serial port
+    push rcx
+    push rdx
+    push rax
+    lea  rsi, [rel .sipi_dbg_prefix]
+    call AsmPrintStr
+    mov  rax, r8
+    call AsmPrintHex64
+    pop  rax
+    pop  rdx
+    pop  rcx
+
+    ; Read IA32_VMX_TRUE_ENTRY_CTLS (0x490) since bit 55 of IA32_VMX_BASIC is 1
+    mov  ecx, 0x490
+    rdmsr                        ; eax=FIXED0, edx=FIXED1
+
+    and  eax, ~(1 << 9)          ; remove IA-32e from mandatory set
+    or   r8d, eax                ; apply remaining mandatory-1 bits
+    and  r8d, edx                ; mask out bits FIXED1 says must be 0
+
+    ; Explicitly clear bit 9 last — overrides everything
+    btr  r8, 9
+
+    mov  rcx, 0x4012
+    vmwrite rcx, r8
+
+    ; Read back and print new ENC
+    vmread r9, rcx
+    push rcx
+    push rdx
+    push rax
+    lea  rsi, [rel .sipi_dbg_mid]
+    call AsmPrintStr
+    mov  rax, r9
+    call AsmPrintHex64
+    lea  rsi, [rel .sipi_crlf]
+    call AsmPrintStr
+    pop  rax
+    pop  rdx
+    pop  rcx
+
+    ; 8.1. Explicitly configure VMCS Link Pointer and DR7 for strict real-mode compliance
+    mov  rcx, 0x2800         ; GUEST_VMCS_LINK_PTR
+    mov  rax, 0xFFFFFFFFFFFFFFFF
+    vmwrite rcx, rax
+
+    mov  rcx, 0x681A         ; GUEST_DR7
+    mov  rax, 0x400
     vmwrite rcx, rax
 
     ; Zero GUEST_EFER so the guest doesn't run with LME=1
