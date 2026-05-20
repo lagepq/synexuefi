@@ -12,13 +12,63 @@
 #include <Protocol/LoadedImage.h>
 #include <Library/DevicePathLib.h>
 
+// --- Local definitions for EFI_MP_SERVICES_PROTOCOL ---
+typedef struct _EFI_MP_SERVICES_PROTOCOL EFI_MP_SERVICES_PROTOCOL;
+
+typedef VOID (EFIAPI *EFI_AP_PROCEDURE)(IN VOID *Buffer);
+
+typedef EFI_STATUS (EFIAPI *EFI_MP_SERVICES_GET_NUMBER_OF_PROCESSORS)(
+  IN EFI_MP_SERVICES_PROTOCOL *This,
+  OUT UINTN *NumberOfProcessors,
+  OUT UINTN *NumberOfEnabledProcessors
+  );
+
+typedef EFI_STATUS (EFIAPI *EFI_MP_SERVICES_WHO_AM_I)(
+  IN EFI_MP_SERVICES_PROTOCOL *This,
+  OUT UINTN *ProcessorNumber
+  );
+
+typedef EFI_STATUS (EFIAPI *EFI_MP_SERVICES_STARTUP_ALL_APS)(
+  IN EFI_MP_SERVICES_PROTOCOL *This,
+  IN EFI_AP_PROCEDURE Procedure,
+  IN BOOLEAN SingleThread,
+  IN EFI_EVENT WaitEvent OPTIONAL,
+  IN UINTN TimeoutInMicroSeconds,
+  IN VOID *ProcedureArgument OPTIONAL,
+  OUT UINTN **FailedCpuList OPTIONAL
+  );
+
+typedef EFI_STATUS (EFIAPI *EFI_MP_SERVICES_STARTUP_THIS_AP)(
+  IN EFI_MP_SERVICES_PROTOCOL *This,
+  IN EFI_AP_PROCEDURE Procedure,
+  IN UINTN ProcessorNumber,
+  IN EFI_EVENT WaitEvent OPTIONAL,
+  IN UINTN TimeoutInMicroSeconds,
+  IN VOID *ProcedureArgument OPTIONAL,
+  OUT BOOLEAN *Finished OPTIONAL
+  );
+
+struct _EFI_MP_SERVICES_PROTOCOL {
+  EFI_MP_SERVICES_GET_NUMBER_OF_PROCESSORS GetNumberOfProcessors;
+  VOID* GetProcessorInfo;
+  EFI_MP_SERVICES_STARTUP_ALL_APS StartupAllAPs;
+  EFI_MP_SERVICES_STARTUP_THIS_AP StartupThisAP;
+  VOID* SwitchBSP;
+  VOID* EnableDisableAP;
+  EFI_MP_SERVICES_WHO_AM_I WhoAmI;
+};
+
+static EFI_GUID LocalEfiMpServiceProtocolGuid = { 0x3fdda605, 0xa76e, 0x4f46, { 0xad, 0x29, 0x12, 0xf4, 0x53, 0x1b, 0x3d, 0x08 }};
+
+
+
 // Missing EDK II symbols for linker
 GLOBAL_REMOVE_IF_UNREFERENCED const UINT32 _gUefiDriverRevision = 0x00010000;
 GLOBAL_REMOVE_IF_UNREFERENCED CHAR8 *gEfiCallerBaseName = "SynexUefi";
 
 // Global variables for our hypervisor memory
 EFI_PHYSICAL_ADDRESS g_HypervisorMemory = 0;
-UINTN g_HypervisorPages = 2048; // 8MB (2048 * 4KB pages) to hold 512GB EPT Identity Map
+UINTN g_HypervisorPages = 4096; // 16MB: EPT(514p) + Host PT(514p) + handler + per-core structs
 
 // Original function pointers
 typedef
@@ -52,6 +102,81 @@ static VOID DirectPrintUefi(IN CHAR16* String)
     }
 }
 
+#define MAX_CORES 128
+
+typedef struct _CORE_RESOURCES {
+    UINTN ProcessorIndex;
+    EFI_PHYSICAL_ADDRESS VmxonPhys;
+    EFI_PHYSICAL_ADDRESS VmcsPhys;
+    EFI_PHYSICAL_ADDRESS GdtDest;
+    EFI_PHYSICAL_ADDRESS TssPhys;
+    EFI_PHYSICAL_ADDRESS HostStackDest;
+    EFI_PHYSICAL_ADDRESS Ist1StackDest;
+    EFI_PHYSICAL_ADDRESS IdtDest;
+    
+    volatile EFI_STATUS Status;
+    volatile BOOLEAN LaunchCompleted;
+} CORE_RESOURCES;
+
+static CORE_RESOURCES g_CoreResources[MAX_CORES];
+static EFI_MP_SERVICES_PROTOCOL *g_MpServices = NULL;
+
+VOID
+EFIAPI
+ApLaunchHypervisor (
+  IN VOID *Buffer
+  )
+{
+  UINTN CpuIndex = (UINTN)Buffer;
+  if (CpuIndex >= MAX_CORES) {
+    return;
+  }
+  
+  CORE_RESOURCES *Res = &g_CoreResources[CpuIndex];
+  
+  if (!IsVmxSupported()) {
+    Res->Status = EFI_UNSUPPORTED;
+    Res->LaunchCompleted = TRUE;
+    return;
+  }
+  
+  EnableVmxOperation(FALSE);
+  
+  if (!InitializeVmxon(Res->VmxonPhys, FALSE)) {
+    Res->Status = EFI_DEVICE_ERROR;
+    Res->LaunchCompleted = TRUE;
+    return;
+  }
+  
+  UINT64 HostStackTop = Res->HostStackDest + (8 * 4096);
+  UINT64 Ist1StackTop = Res->Ist1StackDest + (2 * 4096);
+  
+  if (!InitializeVmcsPerCore(
+          Res->VmcsPhys,
+          Res->GdtDest,
+          Res->TssPhys,
+          HostStackTop,
+          Ist1StackTop,
+          Res->IdtDest,
+          g_HostCr3,
+          g_MsrBitmap,
+          g_HandlerDest
+          )) {
+    Res->Status = EFI_DEVICE_ERROR;
+    Res->LaunchCompleted = TRUE;
+    return;
+  }
+  
+  Res->Status = EFI_SUCCESS;
+  Res->LaunchCompleted = TRUE;
+  
+  // Launch VMX on this AP core!
+  UINT64 StatusLaunch = AsmVmlaunchAndCaptureState();
+  if (StatusLaunch == 0) {
+    Res->Status = EFI_DEVICE_ERROR;
+  }
+}
+
 // Our Hooked ExitBootServices
 EFI_STATUS
 EFIAPI
@@ -75,6 +200,13 @@ HookedExitBootServices (
       return RetryStatus;
   }
 
+  // Force reset and enable the text console to draw logs directly to the PC monitor in a premium style!
+  if (gST && gST->ConOut) {
+      gST->ConOut->Reset(gST->ConOut, FALSE);
+      gST->ConOut->SetAttribute(gST->ConOut, 0x0A); // Sleek Matrix Green text on Black background!
+      gST->ConOut->ClearScreen(gST->ConOut);
+  }
+
   // We do NOT call LogCloseFile() here anymore to let disk/screen logs capture all initialization steps!
   ComPrint("[SynexHV] ExitBootServices intercepted. Launching hypervisor...\r\n");
 
@@ -86,18 +218,61 @@ HookedExitBootServices (
   }
   ComPrint("[SynexHV] VMX is supported.\r\n");
 
-  ComPrint("[SynexHV] Enabling VMX in CR4...\r\n");
-  EnableVmxOperation();
-  ComPrint("[SynexHV] VMX enabled in CR4.\r\n");
+  // 1. Locate MP Services Protocol
+  UINTN NumberOfProcessors = 1;
+  UINTN NumberOfEnabledProcessors = 1;
+  
+  EFI_STATUS MpStatus = gBS->LocateProtocol(&LocalEfiMpServiceProtocolGuid, NULL, (VOID**)&g_MpServices);
+  if (EFI_ERROR(MpStatus)) {
+    ComPrint("[SynexHV] Warning: EFI_MP_SERVICES_PROTOCOL not found. Operating in single-core fallback.\r\n");
+    g_MpServices = NULL;
+  } else {
+    g_MpServices->GetNumberOfProcessors(g_MpServices, &NumberOfProcessors, &NumberOfEnabledProcessors);
+    if (NumberOfProcessors > MAX_CORES) {
+      NumberOfProcessors = MAX_CORES;
+    }
+  }
 
-  ComPrint("[SynexHV] Entering VMX root mode (VMXON)...\r\n");
-  if (!InitializeVmxon()) {
-    ComPrint("[!] VMXON failed.\r\n");
+  ComPrint("[SynexHV] Total cores found: ");
+  ComPrintHex((UINT64)NumberOfProcessors);
+  ComPrint("\r\n");
+
+  // 2. Preallocate all per-core resources on BSP
+  for (UINTN i = 0; i < NumberOfProcessors; i++) {
+    g_CoreResources[i].ProcessorIndex = i;
+    g_CoreResources[i].VmxonPhys = MemAllocatePages(1);
+    g_CoreResources[i].VmcsPhys = MemAllocatePages(1);
+    g_CoreResources[i].GdtDest = MemAllocatePages(1);
+    g_CoreResources[i].TssPhys = MemAllocatePages(1);
+    g_CoreResources[i].HostStackDest = MemAllocatePages(8); // 32KB
+    g_CoreResources[i].Ist1StackDest = MemAllocatePages(2); // 8KB
+    g_CoreResources[i].IdtDest = MemAllocatePages(1);
+    
+    g_CoreResources[i].Status = EFI_NOT_STARTED;
+    g_CoreResources[i].LaunchCompleted = FALSE;
+    
+    if (!g_CoreResources[i].VmxonPhys || !g_CoreResources[i].VmcsPhys ||
+        !g_CoreResources[i].GdtDest || !g_CoreResources[i].TssPhys ||
+        !g_CoreResources[i].HostStackDest || !g_CoreResources[i].Ist1StackDest ||
+        !g_CoreResources[i].IdtDest) {
+      ComPrint("[!] Failed to allocate resources for core ");
+      ComPrintHex((UINT64)i);
+      ComPrint("\r\n");
+      LogCloseFile();
+      return g_OriginalExitBootServices(ImageHandle, MapKey);
+    }
+  }
+  ComPrint("[+] Resources allocated for all cores.\r\n");
+
+  // 3. Prepare Shared Resources (MSR Bitmap, VM-Exit handler stub, Host CR3)
+  if (!PrepareSharedResources()) {
+    ComPrint("[!] Failed to prepare shared hypervisor resources.\r\n");
     LogCloseFile();
     return g_OriginalExitBootServices(ImageHandle, MapKey);
   }
-  ComPrint("[+] VMXON success. In VMX Root Mode.\r\n");
+  ComPrint("[+] Shared hypervisor resources prepared.\r\n");
 
+  // 4. Build EPT identity map (shared across all cores)
   ComPrint("[SynexHV] Building EPT identity map...\r\n");
   EPTP Eptp = InitializeEpt();
   if (Eptp.All == 0) {
@@ -107,49 +282,97 @@ HookedExitBootServices (
   }
   ComPrint("[+] EPT 1:1 map built.\r\n");
 
-  ComPrint("[SynexHV] Configuring VMCS fields...\r\n");
-  if (!InitializeVmcs()) {
-    ComPrint("[!] VMCS setup failed.\r\n");
+  // 5. Start all Application Processors (APs) sequentially
+  if (g_MpServices != NULL && NumberOfProcessors > 1) {
+    ComPrint("[SynexHV] Launching hypervisor on APs sequentially...\r\n");
+    for (UINTN i = 1; i < NumberOfProcessors; i++) {
+      ComPrint("[SynexHV] Starting AP Core 0x");
+      ComPrintHex((UINT64)i);
+      ComPrint("...\r\n");
+      
+      MpStatus = g_MpServices->StartupThisAP(
+                                 g_MpServices,
+                                 ApLaunchHypervisor,
+                                 i,                  // ProcessorNumber
+                                 NULL,               // WaitEvent (NULL = blocking wait)
+                                 0,                  // TimeoutInMicroSeconds (0 = wait forever)
+                                 (VOID*)i,           // ProcedureArgument (CpuIndex passed directly)
+                                 NULL                // Finished
+                                 );
+      if (EFI_ERROR(MpStatus)) {
+        ComPrint("[!] StartupThisAP failed for core 0x");
+        ComPrintHex((UINT64)i);
+        ComPrint(" Status: 0x");
+        ComPrintHex((UINT64)MpStatus);
+        ComPrint("\r\n");
+      } else {
+        ComPrint("[+] Core 0x");
+        ComPrintHex((UINT64)i);
+        ComPrint(" virtualized successfully.\r\n");
+      }
+    }
+  }
+
+  // 6. Virtualize Bootstrap Processor (BSP / Core 0)
+  ComPrint("[SynexHV] Virtualizing Bootstrap Processor (BSP / Core 0)...\r\n");
+  CORE_RESOURCES *BspRes = &g_CoreResources[0];
+  
+  BspRes->Status = EFI_SUCCESS;
+  BspRes->LaunchCompleted = TRUE;
+  
+  EnableVmxOperation(TRUE);
+  if (!InitializeVmxon(BspRes->VmxonPhys, TRUE)) {
+    ComPrint("[!] BSP VMXON failed.\r\n");
     LogCloseFile();
     return g_OriginalExitBootServices(ImageHandle, MapKey);
   }
-  ComPrint("[+] VMCS configured. Ready for VMLAUNCH.\r\n");
-
+  
+  UINT64 BspHostStackTop = BspRes->HostStackDest + (8 * 4096);
+  UINT64 BspIst1StackTop = BspRes->Ist1StackDest + (2 * 4096);
+  
+  if (!InitializeVmcsPerCore(
+          BspRes->VmcsPhys,
+          BspRes->GdtDest,
+          BspRes->TssPhys,
+          BspHostStackTop,
+          BspIst1StackTop,
+          BspRes->IdtDest,
+          g_HostCr3,
+          g_MsrBitmap,
+          g_HandlerDest
+          )) {
+    ComPrint("[!] BSP VMCS configuration failed.\r\n");
+    LogCloseFile();
+    return g_OriginalExitBootServices(ImageHandle, MapKey);
+  }
+  
+  ComPrint("[+] BSP VMCS configured. Executing VMLAUNCH on BSP...\r\n");
   g_HypervisorLaunched = TRUE;
 
-  ComPrint("[SynexHV] Executing AsmVmlaunchAndCaptureState (VMLAUNCH) now...\r\n");
+  // Let disk/screen logs finish writing before starting the VMX non-root state
+  LogCloseFile();
 
   UINT64 StatusLaunch = AsmVmlaunchAndCaptureState();
   if (StatusLaunch == 0) {
       UINTN VmError = 0;
       __vmx_vmread(0x4400, &VmError);
-      ComPrint("[!] VMLAUNCH failed! VM_INSTRUCTION_ERROR = 0x");
+      ComPrint("[!] BSP VMLAUNCH failed! VM_INSTRUCTION_ERROR = 0x");
       ComPrintHex(VmError);
       ComPrint("\r\n");
-      LogCloseFile();
   } else {
-      // Guest context — VMLAUNCH succeeded.
-      ComPrint("[+] VMLAUNCH succeeded! Guest is now running in VMX Non-Root mode.\r\n");
+      // Guest context — BSP VMLAUNCH succeeded.
+      ComPrint("[+] BSP VMLAUNCH succeeded! Guest is now running in VMX Non-Root mode.\r\n");
   }
 
-  // Both the host-failure path and the guest-success path reach here.
-  // Close the log file before handing off to firmware ExitBootServices.
-  LogCloseFile();
-
   // Call the original ExitBootServices.
-  // NOTE: Because we allocated pages above (EPT tables, VMCS, host stack,
-  // host page table), the memory map has changed since Windows obtained
-  // its MapKey.  The firmware will return EFI_INVALID_PARAMETER and Windows
-  // will retry ExitBootServices via our HookedExitBootServices with a fresh
-  // MapKey — that second call is handled by the g_HypervisorLaunched branch.
   ComPrint("[*] Calling original ExitBootServices (MapKey=0x");
   ComPrintHex((UINT64)MapKey);
   ComPrint(")...\r\n");
 
+  LogDisableOutput();
   EFI_STATUS EbsStatus = g_OriginalExitBootServices(ImageHandle, MapKey);
 
   // If we get here, ExitBootServices returned an error.
-  // (If it succeeded, all boot services are gone and we never return here.)
   ComPrint("[!] ExitBootServices returned error 0x");
   ComPrintHex((UINT64)EbsStatus);
   ComPrint(" — Windows will retry.\r\n");

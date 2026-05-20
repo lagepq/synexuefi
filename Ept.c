@@ -10,6 +10,78 @@
 EPTP g_EptPointer = {0};
 EPTHOOK_ENTRY g_EptHooks[MAX_EPT_HOOKS] = {0};
 
+// ─────────────────────────────────────────────────────────────────────────────
+// MTRR-aware EPT Memory Type helper
+//
+// For each 2MB physical page, we consult the fixed and variable MTRRs to
+// determine the correct EPT memory type.  Mapping MMIO regions as WB (6)
+// causes the CPU to cache device accesses, which leads to EPT violations and
+// infinite boot loops on real hardware.
+//
+// Rules (Intel SDM Vol 3A §11.11.3 "Example Base and Mask Calculations"):
+//   - Default type = IA32_MTRR_DEF_TYPE[2:0]
+//   - Variable MTRRs override with their own type when the GPA falls within
+//     their base/mask range.
+//   - If any overlapping MTRR is UC (0), the result is UC.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#define MTRR_DEF_TYPE_MSR      0x2FF
+#define MTRR_CAP_MSR           0xFE
+#define MTRR_PHYSBASE0_MSR     0x200  // Base0 .. Base(n-1) at 0x200, 0x202, ...
+#define MTRR_PHYSMASK0_MSR     0x201  // Mask0 .. Mask(n-1) at 0x201, 0x203, ...
+
+static UINT8 GetEptMemoryType(UINT64 PhysicalAddress2MB)
+{
+    // Read default type and whether MTRRs are enabled
+    UINT64 DefType = AsmReadMsr64(MTRR_DEF_TYPE_MSR);
+    BOOLEAN MtrrEnabled  = (DefType >> 11) & 1;
+    UINT8   DefaultType  = (UINT8)(DefType & 0xFF);
+
+    if (!MtrrEnabled)
+        return DefaultType;  // MTRRs disabled: use default for everything
+
+    // How many variable MTRR pairs does this CPU support?
+    UINT64 MtrrCap = AsmReadMsr64(MTRR_CAP_MSR);
+    UINT8  VarCount = (UINT8)(MtrrCap & 0xFF);
+    if (VarCount > 32) VarCount = 32;  // safety cap
+
+    UINT8  ResultType  = DefaultType;
+    BOOLEAN HaveMatch  = FALSE;
+
+    // Physical address of the *first* byte of the 2MB region
+    UINT64 PageBase = PhysicalAddress2MB & ~((UINT64)0x1FFFFF); // 2MB align
+
+    for (UINT8 k = 0; k < VarCount; k++) {
+        UINT64 PhysBase = AsmReadMsr64(MTRR_PHYSBASE0_MSR + k * 2);
+        UINT64 PhysMask = AsmReadMsr64(MTRR_PHYSMASK0_MSR + k * 2);
+
+        // Valid bit (bit 11) must be set
+        if (!(PhysMask & (1ULL << 11)))
+            continue;
+
+        UINT64 Mask = PhysMask & ~((UINT64)0xFFF); // strip flags
+        UINT64 Base = PhysBase & ~((UINT64)0xFFF);
+        UINT8  Type = (UINT8)(PhysBase & 0xFF);
+
+        // Check if any byte of the 2MB region falls within [Base, Base+Region)
+        // A GPA 'a' is covered if: (a & Mask) == (Base & Mask)
+        if ((PageBase & Mask) == (Base & Mask)) {
+            if (!HaveMatch) {
+                ResultType = Type;
+                HaveMatch  = TRUE;
+            } else {
+                // Overlap: UC wins over everything; WB loses to any other
+                if (Type == 0 || ResultType == 0)
+                    ResultType = 0;  // UC
+                else if (Type < ResultType)
+                    ResultType = Type;
+            }
+        }
+    }
+
+    return ResultType;
+}
+
 EPTP InitializeEpt(VOID)
 {
     EPTP EptPointer = {0};
@@ -55,6 +127,7 @@ EPTP InitializeEpt(VOID)
     Pml4[0].Fields.PdptAddress   = (PdptAddr / EFI_PAGE_SIZE);
 
     // 5. Wire PDPT[0..511] -> PDs and fill each PD with 512 x 2MB identity pages
+    //    Use MTRR-aware MemoryType so MMIO regions get UC (0) instead of WB (6).
     PEPT_PDPTE Pdpt = (PEPT_PDPTE)PdptAddr;
     for (UINTN i = 0; i < EPT_PDPT_ENTRIES; i++) {
         Pdpt[i].Fields.ReadAccess    = 1;
@@ -65,10 +138,12 @@ EPTP InitializeEpt(VOID)
         PEPT_PDE_2MB Pd = (PEPT_PDE_2MB)PdAddr[i];
         for (UINTN j = 0; j < 512; j++) {
             UINTN PdeIndex = (i * 512) + j; // global 2MB frame number
+            UINT64 Gpa2MB  = (UINT64)PdeIndex << 21; // physical base of this 2MB page
+
             Pd[j].Fields.ReadAccess      = 1;
             Pd[j].Fields.WriteAccess     = 1;
             Pd[j].Fields.ExecuteAccess   = 1;
-            Pd[j].Fields.MemoryType      = 6; // Write-Back
+            Pd[j].Fields.MemoryType      = GetEptMemoryType(Gpa2MB); // MTRR-aware
             Pd[j].Fields.LargePage       = 1;
             Pd[j].Fields.PhysicalAddress = PdeIndex; // GPA == HPA identity
         }
@@ -79,13 +154,17 @@ EPTP InitializeEpt(VOID)
     EptPointer.Fields.PageWalkLength = 3; // 4-level walk (value = levels - 1)
     EptPointer.Fields.Pml4Address   = (Pml4Addr / EFI_PAGE_SIZE);
 
-    ComPrint("[+] EPT 1:1 Identity Map (512GB) Built Successfully. EPTP: ");
+    ComPrint("[+] EPT 1:1 Identity Map (512GB, MTRR-aware) Built. EPTP: ");
     ComPrintHex(EptPointer.All);
     ComPrint("\r\n");
+
+    // Flush all CPU caches (WBINVD) so EPT walker hardware sees our newly built tables immediately
+    __wbinvd();
 
     g_EptPointer = EptPointer;
     return EptPointer;
 }
+
 
 // Splits a 2MB page in EPT into 512 x 4KB pages
 BOOLEAN SafePageSplit2MB(UINT64 PhysicalAddress)

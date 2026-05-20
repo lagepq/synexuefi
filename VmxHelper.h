@@ -24,8 +24,8 @@ typedef struct _VMCS_REGION {
 // Main initialization functions
 UINT8 AsmVmxon(UINT64 VmxonPhysAddr);
 BOOLEAN IsVmxSupported(VOID);
-BOOLEAN EnableVmxOperation(VOID);
-BOOLEAN InitializeVmxon(VOID);
+BOOLEAN EnableVmxOperation(IN BOOLEAN Verbose);
+BOOLEAN InitializeVmxon(IN EFI_PHYSICAL_ADDRESS VmxonPhysAddr, IN BOOLEAN Verbose);
 VOID VmxSetMsrBitmap(VOID* Bitmap, UINT32 Msr, BOOLEAN Read, BOOLEAN Write);
 
 

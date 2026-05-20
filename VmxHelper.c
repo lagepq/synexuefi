@@ -36,7 +36,7 @@ BOOLEAN IsVmxSupported(VOID)
     return TRUE;
 }
 
-BOOLEAN EnableVmxOperation(VOID)
+BOOLEAN EnableVmxOperation(IN BOOLEAN Verbose)
 {
     // 1. Configure CR0 using Intel fixed MSRs (forcing CR0.NE=1, CR0.PG=1, CR0.PE=1)
     UINT64 Cr0 = AsmReadCr0();
@@ -44,9 +44,11 @@ BOOLEAN EnableVmxOperation(VOID)
     UINT64 Cr0Fixed1 = AsmReadMsr64(0x487); // IA32_VMX_CR0_FIXED1
     Cr0 = (Cr0 | Cr0Fixed0) & Cr0Fixed1;
     AsmWriteCr0(Cr0);
-    ComPrint("[SynexHV] CR0 configured with VMX fixed bits. CR0 = 0x");
-    ComPrintHex(Cr0);
-    ComPrint("\r\n");
+    if (Verbose) {
+        ComPrint("[SynexHV] CR0 configured with VMX fixed bits. CR0 = 0x");
+        ComPrintHex(Cr0);
+        ComPrint("\r\n");
+    }
 
     // 2. Configure CR4 using Intel fixed MSRs (forcing CR4.VMXE=1)
     UINT64 Cr4 = AsmReadCr4();
@@ -55,26 +57,28 @@ BOOLEAN EnableVmxOperation(VOID)
     UINT64 Cr4Fixed1 = AsmReadMsr64(0x489); // IA32_VMX_CR4_FIXED1
     Cr4 = (Cr4 | Cr4Fixed0) & Cr4Fixed1;
     AsmWriteCr4(Cr4);
-    ComPrint("[SynexHV] CR4 configured with VMX fixed bits. CR4 = 0x");
-    ComPrintHex(Cr4);
-    ComPrint("\r\n");
+    if (Verbose) {
+        ComPrint("[SynexHV] CR4 configured with VMX fixed bits. CR4 = 0x");
+        ComPrintHex(Cr4);
+        ComPrint("\r\n");
+    }
 
     return TRUE;
 }
 
-BOOLEAN InitializeVmxon(VOID)
+BOOLEAN InitializeVmxon(IN EFI_PHYSICAL_ADDRESS VmxonPhysAddr, IN BOOLEAN Verbose)
 {
-    // 1. Allocate a 4KB page for the VMXON region
-    EFI_PHYSICAL_ADDRESS VmxonPhysAddr = MemAllocatePages(1);
     if (VmxonPhysAddr == 0) {
-        ComPrint("[!] Failed to allocate VMXON region.\r\n");
+        if (Verbose) ComPrint("[!] Invalid VMXON physical address.\r\n");
         return FALSE;
     }
     SetMem((VOID*)VmxonPhysAddr, 4096, 0);
     
-    ComPrint("[SynexHV] VMXON region allocated at physical address: 0x");
-    ComPrintHex(VmxonPhysAddr);
-    ComPrint("\r\n");
+    if (Verbose) {
+        ComPrint("[SynexHV] VMXON region setup at physical address: 0x");
+        ComPrintHex(VmxonPhysAddr);
+        ComPrint("\r\n");
+    }
     
     PVMCS_REGION VmxonRegion = (PVMCS_REGION)VmxonPhysAddr;
     
@@ -82,39 +86,46 @@ BOOLEAN InitializeVmxon(VOID)
     UINT64 VmxBasic = AsmReadMsr64(MSR_IA32_VMX_BASIC);
     UINT32 RevisionId = (UINT32)(VmxBasic & 0x7FFFFFFF); // Bits 0:30
     
-    ComPrint("[SynexHV] IA32_VMX_BASIC basic details: 0x");
-    ComPrintHex(VmxBasic);
-    ComPrint("\r\n");
-    
-    ComPrint("[SynexHV] Target VMX Revision ID: 0x");
-    ComPrintHex(RevisionId);
-    ComPrint("\r\n");
+    if (Verbose) {
+        ComPrint("[SynexHV] IA32_VMX_BASIC basic details: 0x");
+        ComPrintHex(VmxBasic);
+        ComPrint("\r\n");
+        
+        ComPrint("[SynexHV] Target VMX Revision ID: 0x");
+        ComPrintHex(RevisionId);
+        ComPrint("\r\n");
+    }
     
     VmxonRegion->RevisionId = RevisionId;
     
     UINT64 FeatureControl = AsmReadMsr64(MSR_IA32_FEATURE_CONTROL);
-    ComPrint("[SynexHV] IA32_FEATURE_CONTROL MSR: 0x");
-    ComPrintHex(FeatureControl);
-    ComPrint("\r\n");
+    if (Verbose) {
+        ComPrint("[SynexHV] IA32_FEATURE_CONTROL MSR: 0x");
+        ComPrintHex(FeatureControl);
+        ComPrint("\r\n");
+        
+        // 3. Execute VMXON using our robust, compiler-safe assembly wrapper
+        ComPrint("[SynexHV] Executing AsmVmxon instruction now...\r\n");
+    }
     
-    // 3. Execute VMXON using our robust, compiler-safe assembly wrapper
-    ComPrint("[SynexHV] Executing AsmVmxon instruction now...\r\n");
     UINT8 status = AsmVmxon((UINT64)VmxonPhysAddr);
     
     if (status != 0) {
-        ComPrint("[!] VMXON failed with status code: ");
-        ComPrintHex(status);
-        if (status == 1) {
-            ComPrint(" (VMXON failed with Carry Flag set - VMXON pointer invalid or out of range)\r\n");
-        } else if (status == 2) {
-            ComPrint(" (VMXON failed with Zero Flag set - VMXON failed outside VMXON pointer validation)\r\n");
-        } else {
-            ComPrint("\r\n");
+        if (Verbose) {
+            ComPrint("[!] VMXON failed with status code: ");
+            ComPrintHex(status);
+            if (status == 1) {
+                ComPrint(" (VMXON failed with Carry Flag set - VMXON pointer invalid or out of range)\r\n");
+            } else if (status == 2) {
+                ComPrint(" (VMXON failed with Zero Flag set - VMXON failed outside VMXON pointer validation)\r\n");
+            } else {
+                ComPrint("\r\n");
+            }
         }
         return FALSE;
     }
 
-    ComPrint("[+] VMXON executed successfully on current core. VMX Root Mode active!\r\n");
+    if (Verbose) ComPrint("[+] VMXON executed successfully on current core. VMX Root Mode active!\r\n");
     return TRUE;
 }
 

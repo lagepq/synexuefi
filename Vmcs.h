@@ -3,8 +3,25 @@
 
 #include <Uefi.h>
 #include <Library/UefiBootServicesTableLib.h>
+#include <Library/BaseMemoryLib.h>
 
-BOOLEAN InitializeVmcs(VOID);
+extern EFI_PHYSICAL_ADDRESS g_MsrBitmap;
+extern EFI_PHYSICAL_ADDRESS g_HandlerDest;
+extern UINT64 g_HostCr3;
+
+BOOLEAN PrepareSharedResources(VOID);
+
+BOOLEAN InitializeVmcsPerCore(
+  IN EFI_PHYSICAL_ADDRESS VmcsPhys,
+  IN EFI_PHYSICAL_ADDRESS GdtDest,
+  IN EFI_PHYSICAL_ADDRESS TssPhys,
+  IN EFI_PHYSICAL_ADDRESS HostStackTop,
+  IN EFI_PHYSICAL_ADDRESS Ist1StackTop,
+  IN EFI_PHYSICAL_ADDRESS IdtDest,
+  IN UINT64 HostCr3,
+  IN EFI_PHYSICAL_ADDRESS MsrBitmap,
+  IN EFI_PHYSICAL_ADDRESS HandlerDest
+  );
 
 // Assembly: sets Guest RSP/RIP from call stack then executes VMLAUNCH.
 // After VMLAUNCH succeeds, guest resumes at the caller's return site.

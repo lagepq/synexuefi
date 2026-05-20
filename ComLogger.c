@@ -137,8 +137,12 @@ VOID LogInitBuffer(VOID)
 
 VOID LogCloseFile(VOID)
 {
-    g_ExitBootServicesTriggered = TRUE;
     g_LogFile = NULL;
+}
+
+VOID LogDisableOutput(VOID)
+{
+    g_ExitBootServicesTriggered = TRUE;
 }
 
 

@@ -14,6 +14,7 @@ VOID ComPrintHex(UINT64 Value);
 VOID LogInitFile(EFI_HANDLE ImageHandle);
 VOID LogInitBuffer(VOID);
 VOID LogCloseFile(VOID);
+VOID LogDisableOutput(VOID);
 EFI_PHYSICAL_ADDRESS LogGetBufferAddress(VOID);
 
 #endif // COM_LOGGER_H

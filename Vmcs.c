@@ -9,6 +9,7 @@
 #include <Library/BaseMemoryLib.h>
 #include <Library/UefiLib.h>
 #include <intrin.h>
+#include <Protocol/GraphicsOutput.h>
 
 // VMCS field encodings
 #define PIN_BASED_VM_EXEC_CONTROL 0x00004000
@@ -163,7 +164,20 @@ typedef struct {
 
 // Adjust a VMX control value using allowed-0/allowed-1 from MSR
 static UINT32 AdjustVmxControl(UINT32 Desired, UINT32 MsrAddr) {
-  UINT64 Msr = AsmReadMsr64(MsrAddr);
+  UINT64 Basic = AsmReadMsr64(0x480); // MSR_IA32_VMX_BASIC
+  UINT32 ActualMsr = MsrAddr;
+  
+  // If bit 55 of IA32_VMX_BASIC is 0, we must fall back to standard VMX controls MSRs
+  if ((Basic & (1ULL << 55)) == 0) {
+    switch (MsrAddr) {
+      case MSR_IA32_VMX_TRUE_PINBASED_CTLS:  ActualMsr = 0x481; break; // standard PINBASED
+      case MSR_IA32_VMX_TRUE_PROCBASED_CTLS: ActualMsr = 0x482; break; // standard PROCBASED
+      case MSR_IA32_VMX_TRUE_EXIT_CTLS:      ActualMsr = 0x483; break; // standard EXIT
+      case MSR_IA32_VMX_TRUE_ENTRY_CTLS:     ActualMsr = 0x484; break; // standard ENTRY
+    }
+  }
+
+  UINT64 Msr = AsmReadMsr64(ActualMsr);
   UINT32 Mandatory1s = (UINT32)(Msr & 0xFFFFFFFF); // must be 1
   UINT32 Allowed1s = (UINT32)(Msr >> 32);          // may be 1
   return (Desired | Mandatory1s) & Allowed1s;
@@ -282,14 +296,145 @@ static UINT16 FindTssSelector(UINT64 GdtBase, UINT16 GdtLimit) {
   return 0;
 }
 
-BOOLEAN InitializeVmcs(VOID) {
-  // 1. Allocate and init VMCS region
-  EFI_PHYSICAL_ADDRESS VmcsPhys = MemAllocatePages(1);
-  if (!VmcsPhys) {
-    ComPrint("[!] VMCS alloc failed.\r\n");
+EFI_PHYSICAL_ADDRESS g_MsrBitmap = 0;
+EFI_PHYSICAL_ADDRESS g_HandlerDest = 0;
+UINT64 g_HostCr3 = 0;
+
+BOOLEAN PrepareSharedResources(VOID) {
+  // 1. Allocate & Setup MSR Bitmap (filled with 0 = no MSRs cause exits)
+  g_MsrBitmap = MemAllocatePages(1);
+  if (!g_MsrBitmap) {
+    ComPrint("[!] Shared MSR Bitmap alloc failed.\r\n");
     return FALSE;
   }
-  SetMem((VOID *)VmcsPhys, 4096, 0);
+  SetMem((VOID *)g_MsrBitmap, 4096, 0);
+  VmxSetMsrBitmap((VOID *)g_MsrBitmap, 0x3A, TRUE, FALSE);
+  VmxSetMsrBitmap((VOID *)g_MsrBitmap, 0x1D9, TRUE, TRUE);
+  VmxSetMsrBitmap((VOID *)g_MsrBitmap, 0x570, TRUE, TRUE);
+  VmxSetMsrBitmap((VOID *)g_MsrBitmap, 0xC0000082, FALSE, TRUE);
+
+  // 2. Copy VM-Exit handler stub to heap
+  #define HANDLER_HEADER_SIZE 128
+  UINTN HandlerSize = (UINTN)MinimalVmexitHandlerEnd - (UINTN)MinimalVmexitHandlerStart;
+  g_HandlerDest = MemAllocatePages(3);   // 3 pages = 12 KB; large enough for handler + helpers
+  if (!g_HandlerDest) {
+    ComPrint("[!] Shared VM-Exit handler alloc failed.\r\n");
+    return FALSE;
+  }
+
+  // Allocate 4KB circular exit-reason ring buffer
+  EFI_PHYSICAL_ADDRESS DebugLogPage = MemAllocatePages(1);
+  if (!DebugLogPage) {
+    ComPrint("[!] Shared Debug log page alloc failed.\r\n");
+    return FALSE;
+  }
+
+  *((UINT64 *)(g_HandlerDest + 0)) = (UINT64)DebugLogPage;
+  *((UINT64 *)(g_HandlerDest + 8)) = 0ULL;
+  *((UINT64 *)(g_HandlerDest + 16)) = 0ULL; // virtual DEBUGCTL
+  *((UINT64 *)(g_HandlerDest + 24)) = 0ULL; // virtual RTIT_CTL
+  *((UINT64 *)(g_HandlerDest + 32)) = 0ULL; // LSTAR
+  *((UINT64 *)(g_HandlerDest + 40)) = 0ULL; // authenticated CR3
+  *((UINT64 *)(g_HandlerDest + 48)) = 0ULL; // backdoor flags
+  *((UINT64 *)(g_HandlerDest + 56)) = 0ULL; // reserved
+
+  // Store Framebuffer info for screen logging
+  EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop = NULL;
+  gBS->LocateProtocol(&gEfiGraphicsOutputProtocolGuid, NULL, (VOID**)&Gop);
+  if (Gop && Gop->Mode) {
+      *((UINT64 *)(g_HandlerDest + 64)) = Gop->Mode->FrameBufferBase;
+      *((UINT32 *)(g_HandlerDest + 72)) = Gop->Mode->Info->HorizontalResolution;
+      *((UINT32 *)(g_HandlerDest + 76)) = Gop->Mode->Info->VerticalResolution;
+      *((UINT32 *)(g_HandlerDest + 80)) = Gop->Mode->Info->PixelsPerScanLine;
+      *((UINT32 *)(g_HandlerDest + 84)) = 0; // Current X cursor
+      *((UINT32 *)(g_HandlerDest + 88)) = 0; // Current Y cursor
+  } else {
+      *((UINT64 *)(g_HandlerDest + 64)) = 0;
+  }
+
+  CopyMem((VOID *)(g_HandlerDest + HANDLER_HEADER_SIZE),
+          (VOID *)MinimalVmexitHandlerStart, HandlerSize);
+
+  ComPrint("[*] Shared Handler base: 0x");
+  ComPrintHex((UINT64)g_HandlerDest);
+  ComPrint("  HandlerSize: 0x");
+  ComPrintHex((UINT64)HandlerSize);
+  ComPrint("  Shared DebugLog: 0x");
+  ComPrintHex((UINT64)DebugLogPage);
+  ComPrint("\r\n");
+
+  // 3. Build a private 4-level identity-map host page table (PML4 → PDPT → 512 PDs of 2MB pages).
+  //
+  // We CANNOT reuse the UEFI boot-services CR3 here.  winload.efi invalidates
+  // every boot-services page immediately after ExitBootServices returns, so the
+  // first VM-exit after the OS takes control would triple-fault when the CPU
+  // tries to walk a now-gone UEFI page table.
+  //
+  // All allocations go through MemAllocatePages which pulls from the 8MB
+  // EfiRuntimeServicesData region allocated at startup — memory that Windows
+  // leaves completely intact forever.
+
+  // PML4 (1 page)
+  EFI_PHYSICAL_ADDRESS HostPml4 = MemAllocatePages(1);
+  if (!HostPml4) { ComPrint("[!] Host PML4 alloc failed.\r\n"); return FALSE; }
+  SetMem((VOID *)HostPml4, 4096, 0);
+
+  // PDPT (1 page, covers 512 × 1GB = 512GB)
+  EFI_PHYSICAL_ADDRESS HostPdpt = MemAllocatePages(1);
+  if (!HostPdpt) { ComPrint("[!] Host PDPT alloc failed.\r\n"); return FALSE; }
+  SetMem((VOID *)HostPdpt, 4096, 0);
+
+  // 512 PDs, each mapping 512 × 2MB = 1GB
+  #define HOST_PT_PDPT_ENTRIES 512
+  EFI_PHYSICAL_ADDRESS HostPd[HOST_PT_PDPT_ENTRIES];
+  for (UINTN i = 0; i < HOST_PT_PDPT_ENTRIES; i++) {
+    HostPd[i] = MemAllocatePages(1);
+    if (!HostPd[i]) { ComPrint("[!] Host PD alloc failed.\r\n"); return FALSE; }
+    SetMem((VOID *)HostPd[i], 4096, 0);
+  }
+
+  // Wire PML4[0] → PDPT  (bit 0=P, bit 1=RW, bit 2=US, bit 3=PWT, bit 4=PCD, bit 5=A)
+  UINT64 *Pml4e = (UINT64 *)HostPml4;
+  Pml4e[0] = HostPdpt | 0x3;  // P + RW
+
+  // Wire PDPT[i] → PD[i] and fill PD[i] with 512 × 2MB identity pages
+  UINT64 *Pdpte = (UINT64 *)HostPdpt;
+  for (UINTN i = 0; i < HOST_PT_PDPT_ENTRIES; i++) {
+    Pdpte[i] = HostPd[i] | 0x3;  // P + RW
+
+    UINT64 *Pde = (UINT64 *)HostPd[i];
+    for (UINTN j = 0; j < 512; j++) {
+      UINT64 Phys2MB = ((UINT64)(i * 512 + j)) << 21; // 2MB aligned GPA
+      // bit 7 = PS (2MB page), bit 1 = RW, bit 0 = P
+      Pde[j] = Phys2MB | 0x83;  // P + RW + PS(large)
+    }
+  }
+
+  g_HostCr3 = HostPml4;
+
+  ComPrint("[*] Private Host CR3 built: 0x");
+  ComPrintHex(g_HostCr3);
+  ComPrint("\r\n");
+
+  return TRUE;
+}
+
+BOOLEAN InitializeVmcsPerCore(
+  IN EFI_PHYSICAL_ADDRESS VmcsPhys,
+  IN EFI_PHYSICAL_ADDRESS GdtDest,
+  IN EFI_PHYSICAL_ADDRESS TssPhys,
+  IN EFI_PHYSICAL_ADDRESS HostStackTop,
+  IN EFI_PHYSICAL_ADDRESS Ist1StackTop,
+  IN EFI_PHYSICAL_ADDRESS IdtDest,
+  IN UINT64 HostCr3,
+  IN EFI_PHYSICAL_ADDRESS MsrBitmap,
+  IN EFI_PHYSICAL_ADDRESS HandlerDest
+  ) 
+{
+  if (!VmcsPhys || !GdtDest || !TssPhys || !HostStackTop || !Ist1StackTop || !IdtDest || !HostCr3 || !MsrBitmap || !HandlerDest) {
+    ComPrint("[!] InitializeVmcsPerCore: Null parameter passed.\r\n");
+    return FALSE;
+  }
 
   PVMCS_REGION Vmcs = (PVMCS_REGION)VmcsPhys;
   UINT64 VmxBasic = AsmReadMsr64(MSR_IA32_VMX_BASIC);
@@ -313,42 +458,37 @@ BOOLEAN InitializeVmcs(VOID) {
   AsmReadIdtr(&Idtr);
   UINT16 CsSel = AsmReadCs();
   UINT16 SsSel = AsmReadSs();
+  UINT16 DsSel = AsmReadDs();
+  UINT16 EsSel = AsmReadEs();
   UINT64 GdtBase = Gdtr.Base;
 
-  // --- VMX TR Synthesis & GDT Relocation (HyperVenom style) ---
-  // 1. Relocate and expand GDT in heap to host our 16-byte TSS descriptor
-  // safely.
-  EFI_PHYSICAL_ADDRESS GdtDest = MemAllocatePages(1);
-  if (!GdtDest) {
-    ComPrint("[!] GDT alloc failed.\r\n");
-    return FALSE;
+  // Synthesize a valid stack segment (SS) selector if it is null in UEFI (common on physical hardware)
+  if ((SsSel & ~0x7) == 0) {
+    if ((DsSel & ~0x7) != 0) {
+      SsSel = DsSel;
+    } else if ((EsSel & ~0x7) != 0) {
+      SsSel = EsSel;
+    } else {
+      for (UINT16 Selector = 8; Selector < Gdtr.Limit; Selector += 8) {
+        PGDT_ENTRY Entry = (PGDT_ENTRY)(GdtBase + Selector);
+        // S-bit (bit 4) = 1 (code/data), Executable bit 3 = 0 (data segment)
+        if ((Entry->Access & 0x10) != 0 && (Entry->Access & 0x08) == 0) {
+          SsSel = Selector;
+          break;
+        }
+      }
+    }
+    // If still null, fallback to standard flat data selector
+    if ((SsSel & ~0x7) == 0) {
+      SsSel = 0x30; // standard UEFI 64-bit flat data selector
+    }
   }
-  SetMem((VOID *)GdtDest, 4096, 0);
+
+  // --- VMX TR Synthesis & GDT Relocation (HyperVenom style) ---
+  // Copy current core's GDT to the preallocated destination
   CopyMem((VOID *)GdtDest, (VOID *)Gdtr.Base, Gdtr.Limit + 1);
 
-  // Allocate Host Stack in heap (32KB = 8 pages) early so we can refer to it
-  EFI_PHYSICAL_ADDRESS HostStackDest = MemAllocatePages(8);
-  if (!HostStackDest) {
-    ComPrint("[!] Host Stack alloc failed.\r\n");
-    return FALSE;
-  }
-  UINT64 HostStackTop = HostStackDest + (8 * 4096);
-
-  // 2. Allocate a dedicated physical page for TSS to guarantee correctness in
-  // VMX root/non-root.
-  EFI_PHYSICAL_ADDRESS TssPhys = MemAllocatePages(1);
-  if (!TssPhys) {
-    ComPrint("[!] TSS alloc failed.\r\n");
-    return FALSE;
-  }
-  SetMem((VOID *)TssPhys, 4096, 0);
-
-  // Allocate dedicated IST1 stack for double fault (8KB = 2 pages)
-  EFI_PHYSICAL_ADDRESS Ist1Stack = MemAllocatePages(2);
-  if (!Ist1Stack) { ComPrint("[!] IST1 stack alloc failed.\r\n"); return FALSE; }
-  UINT64 Ist1StackTop = Ist1Stack + (2 * 4096);
-
-  // Initialize 64-bit TSS structure
+  // Initialize 64-bit TSS structure on this core's preallocated TSS page
   typedef struct {
       UINT32 Reserved0;
       UINT64 RSP0;        // Stack for CPL 0
@@ -368,13 +508,17 @@ BOOLEAN InitializeVmcs(VOID) {
   } TSS64;
 
   TSS64* Tss = (TSS64*)TssPhys;
-  Tss->RSP0 = HostStackTop;      // Reuse host stack for CPL transitions
-  Tss->IST1 = Ist1StackTop;      // Dedicated stack for Double Fault (#DF)
+  Tss->RSP0 = HostStackTop;      // Use per-core host stack
+  Tss->IST1 = Ist1StackTop;      // Use per-core IST1 stack
   Tss->IOMapBase = sizeof(TSS64); // No I/O permission bitmap
 
-  // Setup expanded TSS descriptor at selector 0x40 in relocated GDT
-  // (GDT_ENTRY64 format)
-  PGDT_ENTRY64 TssDesc = (PGDT_ENTRY64)((UINT8 *)GdtDest + 0x40);
+  // --- Dynamic TSS placement: append at end of GDT (never overwrite existing entries) ---
+  // Align TSS selector to next 16-byte boundary after the existing GDT content
+  // A 64-bit TSS descriptor takes 16 bytes (two 8-byte GDT slots)
+  UINT16 TrSel = (Gdtr.Limit + 1 + 15) & ~15; // Round up to 16-byte alignment
+  if ((UINTN)TrSel + 16 > 4096) TrSel = 0x40;  // Fallback: shouldn't happen
+
+  PGDT_ENTRY64 TssDesc = (PGDT_ENTRY64)((UINT8 *)GdtDest + TrSel);
   TssDesc->LimitLow = 0x67;
   TssDesc->BaseLow = (UINT16)(TssPhys & 0xFFFF);
   TssDesc->BaseMid = (UINT8)((TssPhys >> 16) & 0xFF);
@@ -384,10 +528,12 @@ BOOLEAN InitializeVmcs(VOID) {
   TssDesc->BaseUpper = (UINT32)(TssPhys >> 32);
   TssDesc->Reserved = 0;
 
-  UINT16 TrSel = 0x40; // Dedicated TSS selector in our custom GDT
   UINT32 GuestTrLimit = 0x67;
   UINT32 GuestTrAr = 0x008B; // Present, DPL 0, Busy 64-bit TSS
   UINT64 GuestTrBase = TssPhys;
+
+  // New GDT limit covers our TSS descriptor (TrSel + 15 = last byte of 16-byte TSS entry)
+  UINT16 NewGdtLimit = TrSel + 15;
 
   // 3. Set VM-Execution Controls
   UINT32 PinCtls = AdjustVmxControl(0, MSR_IA32_VMX_TRUE_PINBASED_CTLS);
@@ -395,41 +541,36 @@ BOOLEAN InitializeVmcs(VOID) {
       AdjustVmxControl(CPU_SECONDARY_CONTROLS | CPU_BASED_USE_MSR_BITMAPS,
                        MSR_IA32_VMX_TRUE_PROCBASED_CTLS);
 
-  // Enable EPT (bit 1) in Secondary Controls
-  UINT32 Proc2Ctls = AdjustVmxControl(0x00000002, MSR_IA32_VMX_PROCBASED_CTLS2);
+  // Enable EPT (bit 1) + RDTSCP (bit 3) + INVPCID (bit 12) + Unrestricted Guest (bit 7).
+  // INVPCID is required: without it, Windows kernel INVPCID causes #UD crash.
+  // XSAVES/XRSTORS (bit 20) omitted - needs extra IA32_XSS configuration.
+  #define SECONDARY_ENABLE_UNRESTRICTED_GUEST (1u << 7)
+  UINT32 Proc2Ctls = AdjustVmxControl(
+      0x00000002 | SECONDARY_ENABLE_RDTSCP | SECONDARY_ENABLE_INVPCID | SECONDARY_ENABLE_UNRESTRICTED_GUEST,
+      MSR_IA32_VMX_PROCBASED_CTLS2);
 
   UINT32 ExitCtls =
-      AdjustVmxControl(VMEXIT_HOST_ADDR_SPACE_SIZE | VMEXIT_SAVE_IA32_EFER |
-                           VMEXIT_LOAD_IA32_EFER,
-                       MSR_IA32_VMX_TRUE_EXIT_CTLS);
+      AdjustVmxControl(VMEXIT_HOST_ADDR_SPACE_SIZE | VMEXIT_LOAD_IA32_EFER | VMEXIT_SAVE_IA32_EFER,
+                         MSR_IA32_VMX_TRUE_EXIT_CTLS);
   UINT32 EntryCtls =
       AdjustVmxControl(VMENTRY_IA32E_GUEST | VMENTRY_LOAD_IA32_EFER,
-                       MSR_IA32_VMX_TRUE_ENTRY_CTLS);
+                         MSR_IA32_VMX_TRUE_ENTRY_CTLS);
 
   // Write EPTP to VMCS
   extern EPTP g_EptPointer;
   __vmx_vmwrite(EPT_POINTER, g_EptPointer.All);
 
-  // Allocate 4KB MSR Bitmap (filled with 0 = no MSRs cause VM-Exits)
-  EFI_PHYSICAL_ADDRESS MsrBitmap = MemAllocatePages(1);
-  if (!MsrBitmap) {
-    ComPrint("[!] MSR Bitmap alloc failed.\r\n");
-    return FALSE;
-  }
-  SetMem((VOID *)MsrBitmap, 4096, 0);
+  // Set preallocated MSR Bitmap
   __vmx_vmwrite(MSR_BITMAP, MsrBitmap);
-
-  // Intercept IA32_FEATURE_CONTROL (0x3A) to hide VMX BIOS enablement.
-  // If Windows sees VMX is enabled in BIOS, it will try to launch Hyper-V/VBS,
-  // execute VMXON/VMLAUNCH, which we silently skip, causing a boot freeze.
-  VmxSetMsrBitmap((VOID *)MsrBitmap, 0x3A, TRUE, FALSE);
 
   __vmx_vmwrite(PIN_BASED_VM_EXEC_CONTROL, PinCtls);
   __vmx_vmwrite(CPU_BASED_VM_EXEC_CONTROL, ProcCtls);
   __vmx_vmwrite(SECONDARY_VM_EXEC_CONTROL, Proc2Ctls);
   __vmx_vmwrite(VM_EXIT_CONTROLS, ExitCtls);
   __vmx_vmwrite(VM_ENTRY_CONTROLS, EntryCtls);
-  __vmx_vmwrite(EXCEPTION_BITMAP, 0);
+  
+  // Intercept #UD (Invalid Opcode, bit 6)
+  __vmx_vmwrite(EXCEPTION_BITMAP, (1 << 6));
 
   // CR0/CR4 Shadows and Masks to prevent #GP on guest writes
   __vmx_vmwrite(CR0_GUEST_HOST_MASK, 0); // Allow guest full control of CR0
@@ -439,8 +580,8 @@ BOOLEAN InitializeVmcs(VOID) {
   __vmx_vmwrite(CR4_READ_SHADOW, Cr4 & ~0x2000); // Hide VMXE from guest
 
   // 4. Guest State
-  UINT16 EsSel = AsmReadEs();
-  UINT16 DsSel = AsmReadDs();
+  EsSel = AsmReadEs();
+  DsSel = AsmReadDs();
   UINT16 FsSel = AsmReadFs();
   UINT16 GsSel = AsmReadGs();
 
@@ -454,22 +595,31 @@ BOOLEAN InitializeVmcs(VOID) {
   __vmx_vmwrite(GUEST_LDTR_SELECTOR, 0);
 
   __vmx_vmwrite(GUEST_CS_LIMIT, GetSegmentLimit(GdtBase, CsSel));
-  __vmx_vmwrite(GUEST_SS_LIMIT, GetSegmentLimit(GdtBase, SsSel));
+  // SS limit: use 0xFFFFFFFF when selector is synthesized (limit may not be in GDT)
+  UINT32 SsLimit = GetSegmentLimit(GdtBase, SsSel);
+  if (SsLimit == 0) {
+    SsLimit = 0xFFFFFFFF;
+  }
+  __vmx_vmwrite(GUEST_SS_LIMIT, SsLimit);
   __vmx_vmwrite(GUEST_DS_LIMIT, GetSegmentLimit(GdtBase, DsSel));
   __vmx_vmwrite(GUEST_ES_LIMIT, GetSegmentLimit(GdtBase, EsSel));
   __vmx_vmwrite(GUEST_FS_LIMIT, GetSegmentLimit(GdtBase, FsSel));
   __vmx_vmwrite(GUEST_GS_LIMIT, GetSegmentLimit(GdtBase, GsSel));
   __vmx_vmwrite(GUEST_TR_LIMIT, GuestTrLimit);
   __vmx_vmwrite(GUEST_LDTR_LIMIT, 0xFFFF);
-  UINT16 NewGdtLimit = Gdtr.Limit;
-  if (NewGdtLimit < 0x4F) {
-    NewGdtLimit = 0x4F;
-  }
   __vmx_vmwrite(GUEST_GDTR_LIMIT, NewGdtLimit);
   __vmx_vmwrite(GUEST_IDTR_LIMIT, Idtr.Limit);
 
   __vmx_vmwrite(GUEST_CS_AR, GetSegmentAr(GdtBase, CsSel));
-  __vmx_vmwrite(GUEST_SS_AR, GetSegmentAr(GdtBase, SsSel));
+
+  // GUEST_SS_AR: Intel requires SS to be a usable writable data segment.
+  // If AR comes back as 0x10000 (Unusable) or 0, force a valid flat data segment AR.
+  UINT32 SsAr = GetSegmentAr(GdtBase, SsSel);
+  if (SsAr == 0x10000 || SsAr == 0) {
+    SsAr = 0x0093; // Present, DPL0, S=1 (code/data), Type=3 (writable data), 64-bit
+  }
+  __vmx_vmwrite(GUEST_SS_AR, SsAr);
+
   __vmx_vmwrite(GUEST_DS_AR, GetSegmentAr(GdtBase, DsSel));
   __vmx_vmwrite(GUEST_ES_AR, GetSegmentAr(GdtBase, EsSel));
   __vmx_vmwrite(GUEST_FS_AR, GetSegmentAr(GdtBase, FsSel));
@@ -485,15 +635,14 @@ BOOLEAN InitializeVmcs(VOID) {
   __vmx_vmwrite(GUEST_GS_BASE, AsmReadMsr64(MSR_IA32_GS_BASE));
   __vmx_vmwrite(GUEST_TR_BASE, GuestTrBase);
   __vmx_vmwrite(GUEST_LDTR_BASE, 0);
-  __vmx_vmwrite(GUEST_GDTR_BASE,
-                GdtDest); // Use relocated GDT that has TSS descriptor
+  __vmx_vmwrite(GUEST_GDTR_BASE, GdtDest); // Relocated GDT containing TSS descriptor
   __vmx_vmwrite(GUEST_IDTR_BASE, Idtr.Base);
 
   __vmx_vmwrite(GUEST_CR0, Cr0);
   __vmx_vmwrite(GUEST_CR3, Cr3);
   __vmx_vmwrite(GUEST_CR4, Cr4);
   __vmx_vmwrite(GUEST_DR7, 0x400);
-  __vmx_vmwrite(GUEST_RFLAGS, AsmReadEflags()); // Use exact system flags
+  __vmx_vmwrite(GUEST_RFLAGS, AsmReadEflags()); // exact system flags
 
   __vmx_vmwrite(GUEST_SYSENTER_CS, AsmReadMsr64(MSR_IA32_SYSENTER_CS));
   __vmx_vmwrite(GUEST_SYSENTER_ESP, AsmReadMsr64(MSR_IA32_SYSENTER_ESP));
@@ -507,10 +656,7 @@ BOOLEAN InitializeVmcs(VOID) {
   __vmx_vmwrite(GUEST_RSP, 0);
   __vmx_vmwrite(GUEST_RIP, 0);
 
-  // 5. Host State (Intel Error 0x8 points here)
-
-  // Intel Rule: Host selectors must be non-zero and RPL=0
-  // In UEFI, DS/ES/FS/GS are often 0. We use SS instead.
+  // 5. Host State
   __vmx_vmwrite(HOST_CS_SELECTOR, CsSel & ~0x7);
   __vmx_vmwrite(HOST_SS_SELECTOR, SsSel & ~0x7);
   __vmx_vmwrite(HOST_DS_SELECTOR, SsSel & ~0x7); // Use SS
@@ -521,82 +667,26 @@ BOOLEAN InitializeVmcs(VOID) {
   __vmx_vmwrite(HOST_TR_SELECTOR, TrSel & ~0x7);
 
   __vmx_vmwrite(HOST_CR0, Cr0);
-  __vmx_vmwrite(HOST_CR3, Cr3);
+  __vmx_vmwrite(HOST_CR3, HostCr3); // pre-built runtime host-CR3
   __vmx_vmwrite(HOST_CR4, Cr4);
 
   __vmx_vmwrite(HOST_FS_BASE, AsmReadMsr64(MSR_IA32_FS_BASE));
   __vmx_vmwrite(HOST_GS_BASE, AsmReadMsr64(MSR_IA32_GS_BASE));
   __vmx_vmwrite(HOST_TR_BASE, GuestTrBase);
   __vmx_vmwrite(HOST_GDTR_BASE, GdtDest);
-  __vmx_vmwrite(HOST_IDTR_BASE, Idtr.Base);
+  
+  // Copy IDT to the preallocated destination page
+  CopyMem((VOID *)IdtDest, (VOID *)Idtr.Base, Idtr.Limit + 1);
+  __vmx_vmwrite(HOST_IDTR_BASE, IdtDest);
+
+  // HOST_RIP = HandlerDest + 128 (skip the 128-byte state header)
+  __vmx_vmwrite(HOST_RSP, HostStackTop);
+  __vmx_vmwrite(HOST_RIP, HandlerDest + 128);
 
   __vmx_vmwrite(HOST_SYSENTER_CS, AsmReadMsr64(MSR_IA32_SYSENTER_CS));
   __vmx_vmwrite(HOST_SYSENTER_ESP, AsmReadMsr64(MSR_IA32_SYSENTER_ESP));
   __vmx_vmwrite(HOST_SYSENTER_EIP, AsmReadMsr64(MSR_IA32_SYSENTER_EIP));
   __vmx_vmwrite(HOST_EFER, AsmReadMsr64(MSR_IA32_EFER));
 
-  // ==================================================================
-  // Relocate all host-mode structures to EfiRuntimeServicesData heap
-  // ==================================================================
-
-  // 1. Copy VM-Exit handler to heap.
-  //    The handler page has a 16-byte debug header before the code:
-  //      [HandlerDest + 0]  UINT64  debug-log page physical address
-  //      [HandlerDest + 8]  UINT64  VM-exit counter (starts at 0)
-  //      [HandlerDest +16]  handler machine code  <- HOST_RIP points here
-  UINTN HandlerSize =
-      (UINTN)MinimalVmexitHandlerEnd - (UINTN)MinimalVmexitHandlerStart;
-  EFI_PHYSICAL_ADDRESS HandlerDest = MemAllocatePages(1);
-  if (!HandlerDest) {
-    ComPrint("[!] Handler alloc failed.\r\n");
-    return FALSE;
-  }
-
-  // Separate 4KB page for the exit-reason ring buffer (survives as
-  // EfiRuntimeServicesData)
-  EFI_PHYSICAL_ADDRESS DebugLogPage = MemAllocatePages(1);
-  if (!DebugLogPage) {
-    ComPrint("[!] Debug log page alloc failed.\r\n");
-    return FALSE;
-  }
-
-  *((UINT64 *)(HandlerDest + 0)) = (UINT64)DebugLogPage;
-  *((UINT64 *)(HandlerDest + 8)) = 0ULL;
-  CopyMem((VOID *)(HandlerDest + 16), (VOID *)MinimalVmexitHandlerStart,
-          HandlerSize);
-
-  ComPrint("[*] Handler base: 0x");
-  ComPrintHex((UINT64)HandlerDest);
-  ComPrint("  DebugLog: 0x");
-  ComPrintHex((UINT64)DebugLogPage);
-  ComPrint("\r\n");
-
-  // 3. Copy IDT to heap
-  EFI_PHYSICAL_ADDRESS IdtDest = MemAllocatePages(1);
-  if (!IdtDest) {
-    ComPrint("[!] IDT alloc failed.\r\n");
-    return FALSE;
-  }
-  CopyMem((VOID *)IdtDest, (VOID *)Idtr.Base, Idtr.Limit + 1);
-
-  // 5. Build host-mode page tables in EfiRuntimeServicesData (never freed by
-  // Windows).
-  //    UEFI firmware page tables are in EfiBootServicesData which Windows CAN
-  //    free. Using them as HOST_CR3 causes triple-fault on the first VM-exit
-  //    after handoff.
-  UINT64 HostCr3 = BuildHostPageTable();
-  if (!HostCr3) {
-    ComPrint("[!] Host page table alloc failed.\r\n");
-    return FALSE;
-  }
-
-  // HOST_RIP = HandlerDest + 16 (skip the 16-byte debug header)
-  __vmx_vmwrite(HOST_RSP, HostStackTop);
-  __vmx_vmwrite(HOST_RIP, HandlerDest + 16);
-  __vmx_vmwrite(HOST_GDTR_BASE, GdtDest);
-  __vmx_vmwrite(HOST_IDTR_BASE, IdtDest);
-  __vmx_vmwrite(HOST_CR3, HostCr3);
-
-  ComPrint("[+] VMCS fully configured. Ready for VMLAUNCH.\r\n");
   return TRUE;
 }

@@ -104,8 +104,7 @@ typedef union _EPT_PTE {
         UINT64 Dirty : 1;
         UINT64 ExecuteForUserMode : 1;
         UINT64 Ignored2 : 1;
-        UINT64 Reserved1 : 9;
-        UINT64 PhysicalAddress : 27;
+        UINT64 PhysicalAddress : 36;
         UINT64 Reserved2 : 15;
         UINT64 SuppressVE : 1;
     } Fields;

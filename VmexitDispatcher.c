@@ -150,6 +150,15 @@ BOOLEAN VmexitDispatcher(PGUEST_REGISTERS GuestRegs)
             // -----------------------------------------------
         }
         
+        if (Leaf == 7 && Subleaf == 0) {
+            // -----------------------------------------------
+            // Mask CET_SS (ECX bit 7) and CET_IBT (EDX bit 20)
+            // to prevent EXCEPTION_ON_INVALID_STACK (0x1AA) BSOD
+            Regs[2] &= ~(1u << 7);
+            Regs[3] &= ~(1u << 20);
+            // -----------------------------------------------
+        }
+        
         // Completely block the Hypervisor vendor leaf
         if (Leaf == CPUID_HV_VENDOR_LEAF) {
             Regs[0] = 0;
