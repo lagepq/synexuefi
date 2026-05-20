@@ -53,6 +53,7 @@ BOOLEAN EnableVmxOperation(IN BOOLEAN Verbose)
     // 2. Configure CR4 using Intel fixed MSRs (forcing CR4.VMXE=1)
     UINT64 Cr4 = AsmReadCr4();
     Cr4 |= CR4_VMXE;
+    Cr4 |= (1ULL << 18);  // CR4.OSXSAVE — required for XSETBV in VMX-root mode
     UINT64 Cr4Fixed0 = AsmReadMsr64(0x488); // IA32_VMX_CR4_FIXED0
     UINT64 Cr4Fixed1 = AsmReadMsr64(0x489); // IA32_VMX_CR4_FIXED1
     Cr4 = (Cr4 | Cr4Fixed0) & Cr4Fixed1;

@@ -692,10 +692,19 @@ MinimalVmexitHandlerStart:
     ; ── XSETBV (0x37) ────────────────────────────────────────
     cmp  rbx, EXIT_XSETBV
     jne  .not_xsetbv
+    ; XSETBV requires CR4.OSXSAVE (bit 18) to be set in host CR4,
+    ; otherwise the CPU raises #UD in VMX-root mode.
+    ; Host CR4 set during VMCS init may not include OSXSAVE if the
+    ; UEFI firmware never set it — so we force it here.
+    mov  r11, cr4
+    mov  rax, r11
+    or   rax, (1 << 18)     ; set CR4.OSXSAVE
+    mov  cr4, rax
     mov  rcx, [rsp + STK_RCX]
     mov  rax, [rsp + STK_RAX]
     mov  rdx, [rsp + STK_RDX]
     xsetbv
+    mov  cr4, r11            ; restore original host CR4
     jmp  .advance_rip
 
 .not_xsetbv:

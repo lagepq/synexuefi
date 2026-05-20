@@ -668,7 +668,9 @@ BOOLEAN InitializeVmcsPerCore(
 
   __vmx_vmwrite(HOST_CR0, Cr0);
   __vmx_vmwrite(HOST_CR3, HostCr3); // pre-built runtime host-CR3
-  __vmx_vmwrite(HOST_CR4, Cr4);
+  // Force CR4.OSXSAVE (bit 18) in host CR4 so xsetbv never faults with #UD
+  // during VM-exit handling (XSETBV requires OSXSAVE to be set in VMX-root).
+  __vmx_vmwrite(HOST_CR4, Cr4 | (1ULL << 18));
 
   __vmx_vmwrite(HOST_FS_BASE, AsmReadMsr64(MSR_IA32_FS_BASE));
   __vmx_vmwrite(HOST_GS_BASE, AsmReadMsr64(MSR_IA32_GS_BASE));
