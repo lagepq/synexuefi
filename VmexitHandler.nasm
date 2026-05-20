@@ -2087,11 +2087,11 @@ handle_sipi:
     mov  rcx, 0x6802         ; GUEST_CR3
     vmwrite rcx, rax
 
-    ; GUEST_CR4 = dynamically adjusted 0
+    ; GUEST_CR4 = dynamically adjusted
     xor  r8d, r8d
     mov  ecx, 0x488          ; IA32_VMX_CR4_FIXED0 MSR
     rdmsr
-    and  eax, ~0x2000        ; clear VMXE (bit 13) since guest CR4.VMXE must be 0
+    ; DO NOT clear VMXE (bit 13) here! Let FIXED0 force it to 1.
     or   r8d, eax
     
     mov  ecx, 0x489          ; IA32_VMX_CR4_FIXED1 MSR
@@ -2100,6 +2100,12 @@ handle_sipi:
     
     mov  rcx, 0x6804         ; GUEST_CR4
     vmwrite rcx, r8
+
+    ; Hide VMXE from guest reads via CR4_READ_SHADOW
+    mov  rax, r8
+    and  rax, ~0x2000        ; clear VMXE (bit 13) for shadow read
+    mov  rcx, 0x6006         ; CR4_READ_SHADOW
+    vmwrite rcx, rax
 
     ; GUEST_RFLAGS = 2
     mov  rax, 2
